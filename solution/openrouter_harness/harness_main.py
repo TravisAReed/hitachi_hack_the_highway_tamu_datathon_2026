@@ -16,6 +16,11 @@ def main(argv: list[str] | None = None) -> int:
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--self-test", action="store_true", help="Offline checks. No key and no network.")
     mode.add_argument("--live", action="store_true", help="Call the pinned free route. Requires the environment key.")
+    mode.add_argument(
+        "--diagnose",
+        action="store_true",
+        help="One fictional supplier-delay request. No retries and no account query.",
+    )
     parser.add_argument("--confirm-free-quota", action="store_true")
     parser.add_argument("--budget", type=int, default=10)
     parser.add_argument("--output", type=Path, help="Write sanitized JSON here.")
@@ -31,7 +36,7 @@ def main(argv: list[str] | None = None) -> int:
                     "refusing the live eval without --confirm-free-quota. "
                     "Free accounts allow 50 requests/day and 20/minute, and failed attempts count."
                 )
-            report = live_run(args.budget)
+            report = diagnose() if args.diagnose else live_run(args.budget)
     except Exception as exc:
         return _fail(_public_message(exc))
     code = _emit(report, args.output)
@@ -126,9 +131,53 @@ def self_test(budget: int) -> dict:
     report["guarded_mock_http_attempts"] = guarded["http_attempts"]
     report["guarded_mock_local_rejections"] = guarded["local_rejections"]
     report["zero_attempt_is_failure"] = True
+    diagnostic = _diagnose_mock(config, sentinel)
+    if diagnostic["http_attempts"] != 1 or diagnostic["transport_requests"] != 1:
+        raise RuntimeError("diagnostic sent more than one request")
+    if diagnostic["case_id"] != "supplier-delay" or diagnostic["completions"] != 0:
+        raise RuntimeError("diagnostic did not stay on the first fictional case")
+    if diagnostic["limit_origin"] != "openrouter_platform":
+        raise RuntimeError("platform 429 fixture was not recognized")
+    report["diagnostic_mock_http_attempts"] = diagnostic["http_attempts"]
+    report["diagnostic_mock_limit_origin"] = diagnostic["limit_origin"]
     report["module_sha256"] = _module_hashes()
     report["live_success_claimed"] = False
     return _sanitize(report, sentinel)
+
+
+def diagnose(config=None, transport=None) -> dict:
+    """One chat request, the first fictional supplier-delay case. No second call and no key lookup."""
+    from hth.llm import OpenAICompatibleClient, load_openrouter_config
+    from hth.openrouter_eval import CASES, run_evaluation
+
+    if CASES[0]["id"] != "supplier-delay":
+        raise RuntimeError("diagnostic case is not the fictional supplier delay")
+    if config is None:
+        config = load_openrouter_config()
+    secret = config.api_key or ""
+    inner = transport or urllib.request.urlopen
+    capped = _OneShotTransport(inner)
+    client = _GuardedClient(OpenAICompatibleClient(config, transport=capped), _StartWindow())
+    try:
+        report = run_evaluation(client, 1)
+    finally:
+        config = None
+    report["diagnostic"] = True
+    report["case_id"] = "supplier-delay"
+    report["network_attempts"] = int(report.get("http_attempts") or 0)
+    report["completions"] = 1 if client.llm_invoked else 0
+    report["transport_requests"] = capped.calls
+    error = report["results"][0].get("http_error") if report["results"] else None
+    report["limit_origin"] = error.get("limit_origin") if isinstance(error, dict) else None
+    report["limit_origin_basis"] = error.get("limit_origin_basis") if isinstance(error, dict) else None
+    report["live_success_claimed"] = False
+    report["self_test"] = None
+    if capped.calls > 1:
+        report["integration_error"] = "diagnostic sent more than one request"
+    problem = _integration_error(report)
+    if problem and not report.get("integration_error"):
+        report["integration_error"] = problem
+    return _sanitize(report, secret)
 
 
 def live_run(budget: int) -> dict:
@@ -208,6 +257,20 @@ def _window_check() -> None:
     window.claim()
 
 
+class _OneShotTransport:
+    """Stop before a second socket call. This is not a retry."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.calls = 0
+
+    def __call__(self, request, timeout=60):
+        self.calls += 1
+        if self.calls > 1:
+            raise RuntimeError("diagnostic network cap exceeded")
+        return self._inner(request, timeout)
+
+
 class _StartWindow:
     """Abort before a 20th start inside 60 seconds. This is not a retry."""
 
@@ -240,6 +303,106 @@ class _GuardedClient:
 
     def __getattr__(self, name: str):
         return getattr(self._inner, name)
+
+
+def _diagnose_mock(config, sentinel: str) -> dict:
+    from email.message import Message
+    from io import BytesIO
+    from urllib.error import HTTPError
+
+    from hth.llm import OPENROUTER_BASE_URL, describe_http_error
+    from hth.openrouter_eval import CASES
+
+    _redaction_fixtures(config.api_key, describe_http_error)
+    body = json.dumps(
+        {
+            "id": "gen-diagnostic1",
+            "error": {
+                "code": 429,
+                "message": "Rate limit exceeded",
+                "metadata": {"error_type": "rate_limit_exceeded"},
+            },
+        }
+    ).encode("utf-8")
+    headers = Message()
+    headers["X-RateLimit-Limit"] = "50"
+    headers["X-RateLimit-Remaining"] = "0"
+    headers["X-RateLimit-Reset"] = "1762646400000"
+    headers["Retry-After"] = "60"
+    headers["Set-Cookie"] = "session=secret"
+    headers["Authorization"] = "Bearer " + sentinel
+
+    def transport(request, timeout):
+        del timeout
+        transport.requests.append(request)
+        raise HTTPError(request.full_url, 429, "Too Many Requests", headers, BytesIO(body))
+
+    transport.requests = []
+    report = diagnose(config, transport)
+    encoded = json.dumps(report)
+    if sentinel in encoded or "session=secret" in encoded or "Bearer" in encoded:
+        raise RuntimeError("diagnostic report kept a credential")
+    if report["results"][0]["id"] != "supplier-delay":
+        raise RuntimeError("diagnostic used a different case")
+    sent = json.loads(transport.requests[0].data.decode("utf-8"))
+    if CASES[0]["text"] not in sent["messages"][1]["content"] or CASES[1]["text"] in sent["messages"][1]["content"]:
+        raise RuntimeError("diagnostic did not send only the first fictional case")
+    if transport.requests[0].full_url != OPENROUTER_BASE_URL + "/chat/completions":
+        raise RuntimeError("diagnostic used an unexpected URL")
+    if "Set-Cookie" in encoded or "Authorization" in encoded:
+        raise RuntimeError("diagnostic kept a forbidden header")
+    return report
+
+
+def _redaction_fixtures(secret: str, describe) -> None:
+    from email.message import Message
+    from io import BytesIO
+    from urllib.error import HTTPError
+
+    upstream = _http_error(
+        429,
+        {"error": {"code": 429, "message": "Provider returned error", "metadata": {"provider_code": "rate_limited", "provider_name": "Phala"}}},
+        {"Retry-After": "17"},
+    )
+    upstream_detail = describe(upstream, secret)
+    if upstream_detail["limit_origin"] != "upstream_provider":
+        raise RuntimeError("upstream 429 fixture was not recognized")
+    unknown = _http_error(429, {"error": {"code": 429, "message": "Rate limit exceeded"}}, {"Retry-After": "9"})
+    if describe(unknown, secret)["limit_origin"] != "unknown":
+        raise RuntimeError("an under-specified 429 was classified")
+    conflict = _http_error(
+        429,
+        {"error": {"code": 429, "message": "Rate limit exceeded", "metadata": {"provider_code": "rate_limited"}}},
+        {"X-RateLimit-Limit": "20", "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1"},
+    )
+    if describe(conflict, secret)["limit_origin"] != "unknown":
+        raise RuntimeError("conflicting 429 evidence was classified")
+    leak = _http_error(
+        429,
+        {
+            "error": {
+                "code": 429,
+                "message": "limit " + secret + " Bearer abc.def.ghi sk-or-v1-exampletoken",
+                "metadata": {"raw": secret + ("x" * 500)},
+            }
+        },
+        {"X-Request-Id": "gen-safeid1", "Set-Cookie": "session=secret"},
+    )
+    hidden = json.dumps(describe(leak, secret))
+    if secret in hidden or "sk-or-v1-exampletoken" in hidden or "Bearer abc" in hidden or "session=secret" in hidden:
+        raise RuntimeError("429 fixture leaked a credential")
+    del Message, BytesIO, HTTPError
+
+
+def _http_error(status: int, payload: dict, headers: dict):
+    from email.message import Message
+    from io import BytesIO
+    from urllib.error import HTTPError
+
+    header_map = Message()
+    for key, value in headers.items():
+        header_map[key] = value
+    return HTTPError("https://openrouter.ai/api/v1/chat/completions", status, "error", header_map, BytesIO(json.dumps(payload).encode("utf-8")))
 
 
 def _guarded_mock_run(config, sentinel: str) -> dict:
@@ -305,6 +468,14 @@ def _summary(output: Path, cleaned: dict) -> dict:
     }
     if "guarded_mock_http_attempts" in cleaned:
         summary["guarded_mock_http_attempts"] = cleaned["guarded_mock_http_attempts"]
+    if "diagnostic_mock_http_attempts" in cleaned:
+        summary["diagnostic_mock_http_attempts"] = cleaned["diagnostic_mock_http_attempts"]
+        summary["diagnostic_mock_limit_origin"] = cleaned.get("diagnostic_mock_limit_origin")
+    if cleaned.get("diagnostic"):
+        summary["diagnostic"] = True
+        summary["completions"] = cleaned.get("completions")
+        summary["limit_origin"] = cleaned.get("limit_origin")
+        summary["network_attempts"] = cleaned.get("network_attempts")
     if cleaned.get("integration_error"):
         summary["integration_error"] = cleaned["integration_error"]
     return summary

@@ -36,7 +36,7 @@ python3 hth_openrouter_eval.zip --self-test
 python3 hth_openrouter_eval.zip --live --confirm-free-quota --output eval_result.json
 ```
 
-`--self-test` checks the ten fictional decisions, the transport guards, and the guarded live adapter against a mock transport. It does not use a key or open a network connection. A live run that makes no HTTP attempt exits 2. `--live` was not run from this repository.
+`--self-test` checks the ten fictional decisions, the transport guards, the guarded live adapter against a mock transport, and mocked HTTP 429 bodies. It does not use a key or open a network connection. `--diagnose --confirm-free-quota` sends only the first fictional supplier-delay case, once, and stores the sanitized error. A live run that makes no HTTP attempt exits 2. Neither command was run against OpenRouter from this repository.
 
 ```bash
 python -m solution.hth.dry_run --data hack_the_highway_student_package/hack_the_highway_package/data --text-file message.txt --event-id local-1 --parser stub --stub-file extraction.json

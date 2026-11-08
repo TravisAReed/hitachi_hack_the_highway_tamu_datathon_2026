@@ -362,7 +362,10 @@ def run_evaluation(client, budget: int = EVAL_CALL_BUDGET) -> dict:
         except InterpretError as exc:
             rows.append({"id": case["id"], "decision": "rejected", "tools": [], "writes": False, "error": str(exc)})
         except LiveCallError as exc:
-            rows.append({"id": case["id"], "decision": "aborted", "tools": [], "writes": False, "http_status": exc.status, "kind": exc.kind})
+            row = {"id": case["id"], "decision": "aborted", "tools": [], "writes": False, "http_status": exc.status, "kind": exc.kind}
+            if isinstance(exc.detail, dict):
+                row["http_error"] = exc.detail
+            rows.append(row)
             if exc.kind in {"auth", "payment", "quota", "fallback"}:
                 aborted = exc.kind
                 break

@@ -64,6 +64,8 @@ class StandaloneHarnessTests(unittest.TestCase):
             self.assertEqual(report["guarded_mock_cases"], 10)
             self.assertTrue(report["zero_attempt_is_failure"])
             self.assertEqual(report["guarded_mock_local_rejections"], 1)
+            self.assertEqual(report["diagnostic_mock_http_attempts"], 1)
+            self.assertEqual(report["diagnostic_mock_limit_origin"], "openrouter_platform")
             for name, digest in report["module_sha256"].items():
                 self.assertEqual(hashlib.sha256((PACKAGE / name).read_bytes()).hexdigest(), digest)
             local = run_evaluation(ScriptedExtractor([case["response"] for case in CASES]), 10)

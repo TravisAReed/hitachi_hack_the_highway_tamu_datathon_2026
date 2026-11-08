@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.request
 from dataclasses import dataclass
 from typing import Mapping
@@ -70,9 +71,10 @@ class LlmConfigError(ValueError):
 class LiveCallError(Exception):
     """One live HTTP attempt failed. The client does not retry."""
 
-    def __init__(self, status: int | None, kind: str):
+    def __init__(self, status: int | None, kind: str, detail: dict | None = None):
         self.status = status
         self.kind = kind
+        self.detail = detail
         self.retry = False
         super().__init__(f"live model request failed: {kind}")
 
@@ -289,6 +291,149 @@ def classify_http_status(status: int) -> str:
     return "transport"
 
 
+_RESPONSE_HEADER_ALLOWLIST = frozenset(
+    {
+        "retry-after",
+        "x-ratelimit-limit",
+        "x-ratelimit-remaining",
+        "x-ratelimit-reset",
+        "x-request-id",
+    }
+)
+_METADATA_ALLOWLIST = frozenset(
+    {"error_type", "provider_code", "provider_name", "raw", "limit_source", "reason"}
+)
+_SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
+_SECRET_TEXT = re.compile(
+    r"sk-[A-Za-z0-9_-]{8,}|Bearer\s+\S+|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",
+    re.IGNORECASE,
+)
+
+
+def describe_http_error(exc: HTTPError, secret: str | None = None) -> dict:
+    """Allowlisted response fields only. Request headers are not read."""
+    header_map = _allowlisted_headers(getattr(exc, "headers", None), secret)
+    payload, excerpt = _error_payload(exc, secret)
+    error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+    metadata = error.get("metadata") if isinstance(error.get("metadata"), dict) else {}
+    kept_meta = {}
+    for key in _METADATA_ALLOWLIST:
+        if key in metadata and metadata[key] is not None:
+            kept_meta[key] = _bounded(metadata[key], secret, 400 if key == "raw" else 160)
+    detail = {
+        "http_status": exc.code if isinstance(exc.code, int) else None,
+        "error_code": _bounded(error.get("code"), secret, 40) if "code" in error else None,
+        "error_message": _bounded(error.get("message"), secret, 300) if "message" in error else None,
+        "error_type": kept_meta.get("error_type"),
+        "provider_code": kept_meta.get("provider_code"),
+        "provider_name": kept_meta.get("provider_name"),
+        "raw_excerpt": kept_meta.get("raw"),
+        "limit_source": kept_meta.get("limit_source"),
+        "reason": kept_meta.get("reason"),
+        "retry_after": header_map.get("retry-after"),
+        "rate_limit": {
+            "limit": header_map.get("x-ratelimit-limit"),
+            "remaining": header_map.get("x-ratelimit-remaining"),
+            "reset": header_map.get("x-ratelimit-reset"),
+        },
+        "request_id": _safe_id(payload.get("id") or payload.get("request_id") or header_map.get("x-request-id"), secret),
+        "body_excerpt": excerpt if not error else None,
+    }
+    detail["limit_origin"], detail["limit_origin_basis"] = _limit_origin(detail)
+    return _purge(detail, secret)
+
+
+def _limit_origin(detail: dict) -> tuple[str, str]:
+    rate = detail.get("rate_limit") if isinstance(detail.get("rate_limit"), dict) else {}
+    platform = all(rate.get(name) for name in ("limit", "remaining", "reset"))
+    provider_code = detail.get("provider_code")
+    upstream = isinstance(provider_code, str) and bool(provider_code.strip())
+    if platform and not upstream:
+        return (
+            "openrouter_platform",
+            "X-RateLimit-Limit, X-RateLimit-Remaining, and X-RateLimit-Reset were present, and error.metadata.provider_code was absent.",
+        )
+    if upstream and not platform:
+        return (
+            "upstream_provider",
+            "error.metadata.provider_code was present, and the X-RateLimit trio was absent.",
+        )
+    if platform and upstream:
+        return ("unknown", "The X-RateLimit trio and error.metadata.provider_code were both present.")
+    return ("unknown", "The response did not include enough documented evidence to choose an origin.")
+
+
+def _allowlisted_headers(headers, secret: str | None) -> dict[str, str]:
+    if headers is None:
+        return {}
+    try:
+        pairs = list(headers.items())
+    except Exception:
+        return {}
+    kept = {}
+    for key, value in pairs:
+        name = str(key).lower()
+        if name not in _RESPONSE_HEADER_ALLOWLIST:
+            continue
+        kept[name] = _bounded(value, secret, 80)
+    return kept
+
+
+def _error_payload(exc: HTTPError, secret: str | None) -> tuple[dict, str | None]:
+    try:
+        raw = exc.read(4097)
+    except Exception:
+        return {}, None
+    if not isinstance(raw, (bytes, bytearray)):
+        return {}, None
+    text = bytes(raw[:4096]).decode("utf-8", errors="replace")
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return {}, _bounded(text, secret, 300) if text.strip() else None
+    if not isinstance(parsed, dict):
+        return {}, _bounded(text, secret, 300)
+    return parsed, None
+
+
+def _bounded(value, secret: str | None, limit: int):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    text = _redact(str(value), secret)
+    if len(text) > limit:
+        return text[:limit] + "..."
+    return text
+
+
+def _safe_id(value, secret: str | None) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = _redact(value.strip(), secret)
+    if text == "[redacted]" or not _SAFE_ID.fullmatch(text):
+        return None
+    return text
+
+
+def _redact(text: str, secret: str | None) -> str:
+    if secret and secret in text:
+        text = text.replace(secret, "[redacted]")
+    return _SECRET_TEXT.sub("[redacted]", text)
+
+
+def _purge(value, secret: str | None):
+    if isinstance(value, dict):
+        return {key: _purge(child, secret) for key, child in value.items()}
+    if isinstance(value, list):
+        return [_purge(child, secret) for child in value]
+    if isinstance(value, str):
+        return _redact(value, secret)
+    return value
+
+
 class OpenAICompatibleClient:
     """Live adapter. Construct it only when the operator has set the environment."""
 
@@ -312,7 +457,8 @@ class OpenAICompatibleClient:
             with self._transport(http_request, timeout=60) as response:
                 raw = json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
-            raise LiveCallError(exc.code, classify_http_status(exc.code)) from None
+            detail = describe_http_error(exc, self.config.api_key)
+            raise LiveCallError(exc.code, classify_http_status(exc.code), detail) from None
         except (URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
             raise LiveCallError(None, "transport") from exc
         if not isinstance(raw, dict):

@@ -32,16 +32,29 @@ Offline self-test. No API key and no network:
     python3 hth_openrouter_eval.zip --self-test
     python3 hth_openrouter_eval.zip --self-test --output self_test.json
 
-Live run, only on the computer where HTH_LLM_API_KEY is already in the
-environment. Do not put the key on the command line or in a file. The harness
-reads os.environ and does not print the key or request headers.
+One-request diagnostic, only on the computer where HTH_LLM_API_KEY is already
+in the environment. Do not put the key on the command line or in a file. This
+sends the first fictional supplier-delay case once. It does not retry, does not
+query the account, and does not run the other nine cases.
+
+    python3 hth_openrouter_eval.zip --diagnose --confirm-free-quota --output diag.json
+
+The saved JSON includes the HTTP status, allowlisted error.code, error.message,
+error.metadata fields, Retry-After, X-RateLimit-Limit, X-RateLimit-Remaining,
+X-RateLimit-Reset, and a safe request id when the response has one. Authorization,
+request headers, cookies, and the API key are not written. limit_origin is
+openrouter_platform or upstream_provider only when those documented fields say
+so. Otherwise it is unknown. aborted quota still means the status was 429 and
+the run stopped; it is not by itself an account-cap finding.
+
+The ten-case live command remains available and is a separate, larger run:
 
     python3 hth_openrouter_eval.zip --live --confirm-free-quota --output eval_result.json
 
 Limits: model xingchen-agi/xing4.0-29b-a4b:free, Phala only, strict JSON schema,
 data_collection deny, no model fallback, at most 10 cases, one HTTP attempt
-each, sequential and under 20 starts in any 60 seconds. Auth, payment, quota,
-and a provider or model mismatch abort the suite. Run one copy at a time.
+each, sequential and under 20 starts in any 60 seconds. Auth, payment, an HTTP
+429, and a provider or model mismatch abort the suite. Run one copy at a time.
 
 The JSON report separates cases, http_attempts, and local_rejections. cases
 counts messages considered. http_attempts counts transport calls, including

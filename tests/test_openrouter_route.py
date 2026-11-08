@@ -20,6 +20,7 @@ from solution.hth.llm import (
     LiveCallError,
     OpenAICompatibleClient,
     build_chat_request,
+    describe_http_error,
     load_llm_config,
     load_openrouter_config,
 )
@@ -169,6 +170,77 @@ class FictionalEvaluationTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 2)
         self.assertIn("confirm-free-quota", completed.stderr)
         self.assertNotIn("test-key-not-real", completed.stderr + completed.stdout)
+
+
+class RateLimitDiagnosticTests(unittest.TestCase):
+    def test_429_origins_and_redaction_use_one_attempt(self):
+        from email.message import Message
+        from io import BytesIO
+        from urllib.error import HTTPError
+
+        secret = "sentinel-key-value-not-real"
+        platform = _error(
+            429,
+            {"id": "gen-platform1", "error": {"code": 429, "message": "Rate limit exceeded " + secret, "metadata": {"error_type": "rate_limit_exceeded"}}},
+            {"X-RateLimit-Limit": "50", "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1762646400000", "Set-Cookie": "session=secret", "Authorization": "Bearer " + secret},
+        )
+        platform_detail = describe_http_error(platform, secret)
+        self.assertEqual(platform_detail["limit_origin"], "openrouter_platform")
+        self.assertEqual(platform_detail["request_id"], "gen-platform1")
+        self.assertEqual(platform_detail["retry_after"], None)
+        upstream = _error(
+            429,
+            {"error": {"code": 429, "message": "Provider returned error", "metadata": {"provider_code": "rate_limited", "provider_name": "Phala", "raw": "sk-or-v1-exampletoken"}}},
+            {"Retry-After": "17"},
+        )
+        upstream_detail = describe_http_error(upstream, secret)
+        self.assertEqual(upstream_detail["limit_origin"], "upstream_provider")
+        self.assertEqual(upstream_detail["retry_after"], "17")
+        self.assertNotIn("sk-or-v1-exampletoken", json.dumps(upstream_detail))
+        unknown = _error(429, {"error": {"code": 429, "message": "Rate limit exceeded"}}, {"Retry-After": "9"})
+        self.assertEqual(describe_http_error(unknown, secret)["limit_origin"], "unknown")
+        conflict = _error(
+            429,
+            {"error": {"code": 429, "message": "Rate limit exceeded", "metadata": {"provider_code": "rate_limited"}}},
+            {"X-RateLimit-Limit": "20", "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1"},
+        )
+        self.assertEqual(describe_http_error(conflict, secret)["limit_origin"], "unknown")
+        hidden = json.dumps(platform_detail)
+        self.assertNotIn(secret, hidden)
+        self.assertNotIn("session=secret", hidden)
+        self.assertNotIn("Bearer", hidden)
+        self.assertNotIn("Authorization", hidden)
+
+        calls = []
+
+        def transport(request, timeout):
+            del timeout
+            calls.append(request)
+            header_map = Message()
+            header_map["Retry-After"] = "3"
+            raise HTTPError(request.full_url, 429, "Too Many Requests", header_map, BytesIO(b'{"error":{"code":429,"message":"Rate limit exceeded"}}'))
+
+        config = LlmConfig(OPENROUTER_BASE_URL, OPENROUTER_MODEL, secret, route="openrouter")
+        client = OpenAICompatibleClient(config, transport=transport)
+        with self.assertRaises(LiveCallError) as caught:
+            client.complete("Cedar Cart note: shipment SH-9 is late.")
+        self.assertEqual(client.attempts, 1)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(caught.exception.kind, "quota")
+        self.assertEqual(caught.exception.detail["limit_origin"], "unknown")
+        self.assertNotIn(secret, json.dumps(caught.exception.detail))
+        del Message, BytesIO, HTTPError
+
+
+def _error(status: int, payload: dict, headers: dict):
+    from email.message import Message
+    from io import BytesIO
+    from urllib.error import HTTPError
+
+    header_map = Message()
+    for key, value in headers.items():
+        header_map[key] = value
+    return HTTPError("https://openrouter.ai/api/v1/chat/completions", status, "error", header_map, BytesIO(json.dumps(payload).encode("utf-8")))
 
 
 if __name__ == "__main__":
