@@ -10,6 +10,7 @@ from __future__ import annotations
 from .dates import DateError, parse_date_mention
 from .llm import SchemaError, StubModel, validate_extraction
 from .ontology import Ontology, normalize_name
+from .agents import gate_trace
 from .policy import ASSUMPTIONS, plan_event
 
 GATE = (
@@ -53,8 +54,10 @@ def interpret_and_plan(ontology: Ontology, event_id: str, event_text: str, clien
     provenance = _provenance(client, True, grounded.decision, grounded.reason, grounded.traces)
     if grounded.decision == "noise":
         result = _empty_plan(event_id.strip(), "no operational incident; no write tools proposed")
+        result["orchestration"] = gate_trace("noise", grounded.reason)
     elif grounded.decision == "escalate":
         result = _escalate_plan(event_id.strip(), grounded.reason)
+        result["orchestration"] = gate_trace("escalate", grounded.reason)
     else:
         result = plan_event(ontology, {"event_id": event_id.strip(), "incidents": grounded.structured})
         if result["status"] == "ok":

@@ -8,6 +8,7 @@ import sys
 from datetime import date
 from pathlib import Path
 
+from .architecture import architecture_document
 from .calendarutil import is_working_day
 from .demo import build_demo, build_parse_demo, build_quality_demo
 from .incidents import InputError
@@ -41,6 +42,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Parse a fictional sentence with a labeled stub. This is not a live model call.",
     )
     parser.add_argument("--check-data", action="store_true", help="Load the ontology and print row counts")
+    parser.add_argument(
+        "--export-architecture",
+        type=Path,
+        help="Write the ontology schema and role graph as JSON. Requires --data. Not a picture of one event.",
+    )
     args = parser.parse_args(argv)
     demo_flags = (args.demo, args.demo_quality, args.demo_parse)
     if sum(bool(flag) for flag in demo_flags) > 1:
@@ -65,8 +71,10 @@ def main(argv: list[str] | None = None) -> int:
         return _fail("--parser live does not take --stub-file")
     if args.parser == "stub" and text_mode and args.stub_file is None:
         return _fail("--parser stub needs --stub-file")
-    if not demo and not text_mode and args.input is None and not args.check_data:
-        return _fail("pass --input, --text, --check-data, or a demo flag")
+    if args.export_architecture and args.data is None:
+        return _fail("--export-architecture needs --data")
+    if not demo and not text_mode and args.input is None and not args.check_data and args.export_architecture is None:
+        return _fail("pass --input, --text, --check-data, --export-architecture, or a demo flag")
 
     horizon = None
     if args.horizon:
@@ -87,6 +95,9 @@ def main(argv: list[str] | None = None) -> int:
         elif args.demo_parse:
             ontology, event_id, text, stub = build_parse_demo()
             payload = interpret_and_plan(ontology, event_id, text, stub_client(stub))
+        elif args.export_architecture:
+            ontology = load_ontology(args.data, horizon)
+            payload = architecture_document(ontology)
         elif args.check_data:
             ontology = load_ontology(args.data, horizon)
             payload = {"status": "ok", "data": str(args.data), "counts": ontology.counts()}
@@ -104,7 +115,8 @@ def main(argv: list[str] | None = None) -> int:
     except (InputError, InterpretError, LlmConfigError, SchemaError, OntologyError, OSError, json.JSONDecodeError) as exc:
         return _fail(str(exc))
 
-    return _emit(payload, args.output, None if demo else args.data)
+    destination = args.export_architecture or args.output
+    return _emit(payload, destination, None if demo else args.data)
 
 
 def _read_event(path: Path) -> dict:

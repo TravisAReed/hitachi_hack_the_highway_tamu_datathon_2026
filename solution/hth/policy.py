@@ -93,72 +93,9 @@ def plan_event(ontology: Ontology, event: EventInput | dict) -> dict:
             resolved.append(_resolve(ontology, index, incident))
         except ResolveError as exc:
             blockers.append(f"incidents[{index}]: {exc}")
-    if blockers:
-        return _result(parsed.event_id, "blocked", blockers, resolved, [], [], [], [], [], ["tool calls withheld because the event is blocked"])
-    if not resolved:
-        return _result(
-            parsed.event_id,
-            "ok",
-            [],
-            [],
-            [],
-            [],
-            [],
-            [],
-            [],
-            ["no incidents supplied"],
-        )
+    from .agents import coordinate
 
-    schedule = [item for item in resolved if isinstance(item, (ResolvedDelay, ResolvedOutage))]
-    qualities = [item for item in resolved if isinstance(item, ResolvedQuality)]
-    findings, affected_by_incident, after_horizon = _classify(ontology, schedule)
-    vehicle_findings, quality_hits, quality_blockers = _classify_quality(ontology, qualities)
-    graphs = _graphs(ontology, resolved, affected_by_incident, quality_hits)
-    if after_horizon:
-        blockers.append(
-            "an order inside a disruption is after the scheduling horizon: " + ", ".join(after_horizon)
-        )
-    if blockers or quality_blockers:
-        return _blocked(parsed.event_id, blockers + quality_blockers, resolved, [], findings, graphs, vehicle_findings)
-
-    constraints = _merge(affected_by_incident, schedule)
-    moves, place_blockers = _place(ontology, constraints)
-    affected_orders = _affected_payload(ontology, constraints)
-    if place_blockers:
-        return _blocked(
-            parsed.event_id, place_blockers, resolved, affected_orders, findings, graphs, vehicle_findings
-        )
-
-    notice_blockers, notices, decisions = _commercial(ontology, list(constraints))
-    if notice_blockers:
-        return _blocked(
-            parsed.event_id, notice_blockers, resolved, affected_orders, findings, graphs, vehicle_findings
-        )
-
-    holds, stop_sales, customer_notices = _assemble_quality(qualities, quality_hits)
-    tool_calls = _tool_calls(parsed.event_id, moves, notices, decisions)
-    tool_calls.extend(_quality_calls(parsed.event_id, holds, stop_sales, customer_notices))
-    _check_invariants(tool_calls, list(constraints))
-    notes: list[str] = []
-    if schedule and not constraints:
-        notes.append("no future production orders fall inside the disruption windows")
-    if qualities and not any(quality_hits.values()):
-        notes.append("quality lot held; no finished vehicles matched the lot")
-    return _result(
-        parsed.event_id,
-        "ok",
-        [],
-        resolved,
-        affected_orders,
-        findings,
-        moves,
-        decisions,
-        graphs,
-        notes,
-        tool_calls,
-        vehicle_findings,
-        {"holds": holds, "stop_sales": stop_sales, "customer_notices": customer_notices},
-    )
+    return coordinate(ontology, parsed.event_id, resolved, blockers)
 
 
 def _blocked(event_id, blockers, resolved, affected_orders, findings, graphs, vehicle_findings) -> dict:
@@ -387,12 +324,13 @@ def _merge(affected_by_incident: dict[int, list[str]], incidents: list[Schedule]
     return merged
 
 
-def _place(ontology: Ontology, constraints: dict[str, dict]) -> tuple[list[dict], list[str]]:
-    occupancy: dict[tuple[str, date], set[str]] = defaultdict(set)
-    live = set(ontology.destination_days)
-    for order in ontology.orders.values():
-        if order.build_date in live:
-            occupancy[(order.plant_id, order.build_date)].add(order.production_order_id)
+def _place(ontology: Ontology, constraints: dict[str, dict], occupancy: dict | None = None) -> tuple[list[dict], list[str]]:
+    if occupancy is None:
+        occupancy = defaultdict(set)
+        live = set(ontology.destination_days)
+        for order in ontology.orders.values():
+            if order.build_date in live:
+                occupancy[(order.plant_id, order.build_date)].add(order.production_order_id)
 
     def free(plant_id: str, day: date) -> int:
         return ontology.plants[plant_id].slots_per_day - len(occupancy[(plant_id, day)])

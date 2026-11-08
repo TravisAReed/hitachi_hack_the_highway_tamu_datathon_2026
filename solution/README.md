@@ -65,6 +65,24 @@ Free-text extraction uses categories `supplier_delay`, `plant_outage`, `quality_
 
 If any incident in one message is unconfirmed, or a quote, entity, or date does not resolve, the whole message becomes one `escalate` and no write tools. Noise-only text proposes nothing. Noise next to a resolved incident is ignored. A planner block after a clean resolution, such as no open slot, stays a block. Do not feed `events.json` to a live model from this tool unless you intend to send that text to your configured endpoint.
 
+## Roles
+
+One coordinator merges proposals. Three specialists do not call a model.
+
+| Role | Does | Does not |
+|---|---|---|
+| `supply_chain` | Finds affected future orders and proposes `mes.reschedule` or `mes.transfer` on one shared slot map | Notify dealers, assign loaners, hold lots |
+| `dealer_network` | Groups `dealer.notify` by dealer and `dealer.stop_sale` by dealer | Choose slots or loaner priority |
+| `customer_care` | Ranks loaners on one shared pool, proposes `quality.hold_lot` and `crm.notify_customer` | Move production orders or stop sales |
+
+The coordinator drops every proposal if any specialist blocks or emits a tool outside its allowlist. Noise and unconfirmed text never call the specialists for writes. A trace named `orchestration` lists the handoffs, the graph each role traversed, and `specialist_llm_calls: 0`. Free-text model use stays in `interpretation` and is separate from these roles.
+
+```bash
+python -m solution.hth.dry_run --data hack_the_highway_student_package/hack_the_highway_package/data --export-architecture architecture.json
+```
+
+That file is the table schema and the role graph, with record counts from the loaded tables. It is not a drawing of one event.
+
 ## What the plan contains
 
 `tool_calls` uses the simulator argument names: `mes.reschedule`, `mes.transfer`, `dealer.notify`, `crm.assign_loaner`, `quality.hold_lot`, `dealer.stop_sale`, and `crm.notify_customer`. `moves` explains the slot choice. `findings` gives every production order a schedule reason. `vehicle_findings` gives every finished vehicle a quality reason. `graph_paths` cites Shipment → Part → Model → ProductionOrder → CustomerOrder → Dealer / Customer, Plant → ProductionOrder → CustomerOrder → Dealer / Customer, or Lot → ProductionOrder → Vehicle → Dealer / Customer. `assumptions` is the rule list below.
@@ -89,4 +107,4 @@ These close gaps in the handbook. Uncertain or contradictory inputs produce `sta
 
 ## Tests
 
-Synthetic companies cover window boundaries, unaffected orders, BOM and receiving-plant filters, weekdays, the tool horizon, capacity, transfers, dealer grouping, loaner rank, compound slot sharing, and quality holds. Text tests use labeled stub extractions, not live model calls. They cover alias word boundaries, relative dates, conflicting dates, quotes missing from the text, forged order or VIN fields, noise, escalation, and a compound message that must not leak a partial write. Planner tests still apply plans to an in-memory `Enterprise` loaded from temporary CSVs. The packaged `data/` directory is only read. Live HTTP parsing is implemented and was not executed.
+Synthetic companies cover window boundaries, unaffected orders, BOM and receiving-plant filters, weekdays, the tool horizon, capacity, transfers, dealer grouping, loaner rank, compound slot sharing, and quality holds. Text tests use labeled stub extractions, not live model calls. They cover alias word boundaries, relative dates, conflicting dates, quotes missing from the text, forged order or VIN fields, noise, escalation, and a compound message that must not leak a partial write. Role tests check that supply, dealer, and care each return only their own tools, that noise and unconfirmed reports do not call them for writes, and that two events do not share a loaner pool. Planner tests still apply plans to an in-memory `Enterprise` loaded from temporary CSVs. The packaged `data/` directory is only read. Live HTTP parsing is implemented and was not executed.
