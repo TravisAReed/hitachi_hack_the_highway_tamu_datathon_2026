@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import sys
 import unittest
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -66,6 +66,16 @@ class RealOntologyTests(unittest.TestCase):
         self.assertEqual(self.ontology.destination_days[0], date(2027, 3, 8))
         self.assertEqual(self.ontology.destination_days[-1], date(2027, 4, 2))
         self.assertTrue(all(len(ids) == 1 for ids in self.ontology.shipments_by_key.values()))
+        covered = {}
+        for lot in self.ontology.lots.values():
+            day = lot.first_build_date
+            while day <= lot.last_build_date:
+                if day.weekday() < 5:
+                    key = (lot.part_id, lot.plant_id, day)
+                    self.assertNotIn(key, covered)
+                    covered[key] = lot.lot_id
+                day += timedelta(days=1)
+        self.assertGreater(len(covered), 0)
         for order in self.ontology.orders.values():
             self.assertIn(order.plant_id, self.ontology.plants)
         for customer_order in self.ontology.customer_orders.values():

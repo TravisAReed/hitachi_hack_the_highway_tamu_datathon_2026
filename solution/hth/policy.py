@@ -1,4 +1,4 @@
-"""Deterministic dry-run planner for supplier delays and plant outages.
+"""Deterministic dry-run planner for delays, outages, and quality holds.
 
 The planner proposes tool calls. It does not post them and it does not touch
 the simulator. Assumptions that close handbook gaps are listed in
@@ -12,12 +12,13 @@ from dataclasses import dataclass
 from datetime import date
 
 from .calendarutil import is_working_day, next_working_day
-from .incidents import EventInput, PlantOutageInput, SupplierDelayInput, parse_event
+from .incidents import EventInput, PlantOutageInput, QualityHoldInput, SupplierDelayInput, parse_event
 from .ontology import TIERS, Ontology
 
 SCHEMA_VERSION = 1
 
 DEALER_MESSAGE = "Production for the listed customer orders is delayed or rescheduled."
+QUALITY_MESSAGE = "A vehicle you own is on quality hold. Please contact your dealer."
 
 ASSUMPTIONS = (
     "A production order uses one build slot, matching the simulator, regardless of units.",
@@ -29,6 +30,9 @@ ASSUMPTIONS = (
     "An order in several incidents is moved once. Its legal start is the latest of those incidents. Slots and loaner pools are shared across the event.",
     "Each dealer with an affected customer order gets one dealer.notify, with those customer-order ids sorted lexicographically and no others.",
     "Loaner candidates are affected customer orders in Platinum or Gold, ordered by Platinum, then earlier promised date, then customer_order_id. Standard orders are not assigned a loaner. One candidate is one customer order.",
+    "A quality hold names one lot. A supplied lot_id is confirmed against any part, supplier, plant, or dates also sent. Without a lot_id, part_id, plant_id, and either the lot's exact first and last build dates or a single build_date are required. A single build_date selects the one lot whose inclusive window contains it. Affected vehicles then use that lot's full window. Zero matches, several matches, or a window that is not exactly one lot's dates block the event.",
+    "Affected vehicles were built at the lot's plant on the lot's inclusive build dates, and their production order's model uses the part. The vehicle plant, model, and build date must match that production order.",
+    "in_stock vehicles are grouped into one dealer.stop_sale per dealer, VINs sorted. Each sold owner gets one crm.notify_customer. An in_stock vehicle is not also notified. A sold vehicle with no customer blocks the event. The same lot, VIN, or owner is acted on once. Quality holds do not use build slots or loaner pools.",
     "If a required fact is missing, contradictory, or ambiguous, or any affected order cannot be placed, the event is blocked and no tool calls are proposed.",
 )
 
@@ -62,7 +66,20 @@ class ResolvedOutage:
     legal_start: date
 
 
-Resolved = ResolvedDelay | ResolvedOutage
+@dataclass(frozen=True)
+class ResolvedQuality:
+    index: int
+    lot_id: str
+    part_id: str
+    supplier_id: str
+    plant_id: str
+    first_build_date: date
+    last_build_date: date
+    bom_models: tuple[str, ...]
+
+
+Resolved = ResolvedDelay | ResolvedOutage | ResolvedQuality
+Schedule = ResolvedDelay | ResolvedOutage
 
 
 def plan_event(ontology: Ontology, event: EventInput | dict) -> dict:
@@ -92,62 +109,41 @@ def plan_event(ontology: Ontology, event: EventInput | dict) -> dict:
             ["no incidents supplied"],
         )
 
-    findings, affected_by_incident, after_horizon = _classify(ontology, resolved)
+    schedule = [item for item in resolved if isinstance(item, (ResolvedDelay, ResolvedOutage))]
+    qualities = [item for item in resolved if isinstance(item, ResolvedQuality)]
+    findings, affected_by_incident, after_horizon = _classify(ontology, schedule)
+    vehicle_findings, quality_hits, quality_blockers = _classify_quality(ontology, qualities)
+    graphs = _graphs(ontology, resolved, affected_by_incident, quality_hits)
     if after_horizon:
         blockers.append(
             "an order inside a disruption is after the scheduling horizon: " + ", ".join(after_horizon)
         )
-        return _result(
-            parsed.event_id,
-            "blocked",
-            blockers,
-            resolved,
-            [],
-            findings,
-            [],
-            [],
-            _graphs(ontology, resolved, affected_by_incident),
-            ["tool calls withheld because the event is blocked"],
-        )
+    if blockers or quality_blockers:
+        return _blocked(parsed.event_id, blockers + quality_blockers, resolved, [], findings, graphs, vehicle_findings)
 
-    constraints = _merge(affected_by_incident, resolved)
+    constraints = _merge(affected_by_incident, schedule)
     moves, place_blockers = _place(ontology, constraints)
     affected_orders = _affected_payload(ontology, constraints)
-    graphs = _graphs(ontology, resolved, affected_by_incident)
     if place_blockers:
-        return _result(
-            parsed.event_id,
-            "blocked",
-            place_blockers,
-            resolved,
-            affected_orders,
-            findings,
-            [],
-            [],
-            graphs,
-            ["tool calls withheld because the event is blocked"],
+        return _blocked(
+            parsed.event_id, place_blockers, resolved, affected_orders, findings, graphs, vehicle_findings
         )
 
     notice_blockers, notices, decisions = _commercial(ontology, list(constraints))
     if notice_blockers:
-        return _result(
-            parsed.event_id,
-            "blocked",
-            notice_blockers,
-            resolved,
-            affected_orders,
-            findings,
-            [],
-            [],
-            graphs,
-            ["tool calls withheld because the event is blocked"],
+        return _blocked(
+            parsed.event_id, notice_blockers, resolved, affected_orders, findings, graphs, vehicle_findings
         )
 
+    holds, stop_sales, customer_notices = _assemble_quality(qualities, quality_hits)
     tool_calls = _tool_calls(parsed.event_id, moves, notices, decisions)
+    tool_calls.extend(_quality_calls(parsed.event_id, holds, stop_sales, customer_notices))
     _check_invariants(tool_calls, list(constraints))
     notes: list[str] = []
-    if not constraints:
+    if schedule and not constraints:
         notes.append("no future production orders fall inside the disruption windows")
+    if qualities and not any(quality_hits.values()):
+        notes.append("quality lot held; no finished vehicles matched the lot")
     return _result(
         parsed.event_id,
         "ok",
@@ -160,13 +156,34 @@ def plan_event(ontology: Ontology, event: EventInput | dict) -> dict:
         graphs,
         notes,
         tool_calls,
+        vehicle_findings,
+        {"holds": holds, "stop_sales": stop_sales, "customer_notices": customer_notices},
     )
 
 
-def _resolve(ontology: Ontology, index: int, incident: SupplierDelayInput | PlantOutageInput) -> Resolved:
+def _blocked(event_id, blockers, resolved, affected_orders, findings, graphs, vehicle_findings) -> dict:
+    return _result(
+        event_id,
+        "blocked",
+        blockers,
+        resolved,
+        affected_orders,
+        findings,
+        [],
+        [],
+        graphs,
+        ["tool calls withheld because the event is blocked"],
+        [],
+        vehicle_findings,
+    )
+
+
+def _resolve(ontology: Ontology, index: int, incident: SupplierDelayInput | PlantOutageInput | QualityHoldInput) -> Resolved:
     if isinstance(incident, SupplierDelayInput):
         return _resolve_delay(ontology, index, incident)
-    return _resolve_outage(ontology, index, incident)
+    if isinstance(incident, PlantOutageInput):
+        return _resolve_outage(ontology, index, incident)
+    return _resolve_quality(ontology, index, incident)
 
 
 def _resolve_delay(ontology: Ontology, index: int, incident: SupplierDelayInput) -> ResolvedDelay:
@@ -233,8 +250,86 @@ def _resolve_outage(ontology: Ontology, index: int, incident: PlantOutageInput) 
     )
 
 
+def _resolve_quality(ontology: Ontology, index: int, incident: QualityHoldInput) -> ResolvedQuality:
+    if incident.lot_id:
+        lot = ontology.lots.get(incident.lot_id)
+        if lot is None:
+            raise ResolveError(f"unknown lot_id {incident.lot_id}")
+        _confirm_lot(lot, incident)
+        return _resolved_lot(index, lot, ontology)
+    if not incident.part_id or not incident.plant_id:
+        raise ResolveError("need lot_id, or part_id and plant_id with date evidence")
+    if incident.part_id not in ontology.parts:
+        raise ResolveError(f"unknown part_id {incident.part_id}")
+    if incident.plant_id not in ontology.plants:
+        raise ResolveError(f"unknown plant_id {incident.plant_id}")
+    if incident.supplier_id and incident.supplier_id not in ontology.suppliers:
+        raise ResolveError(f"unknown supplier_id {incident.supplier_id}")
+    mode, first, last = _quality_dates(incident)
+    matched = []
+    for lot in ontology.lots.values():
+        if lot.part_id != incident.part_id or lot.plant_id != incident.plant_id:
+            continue
+        if incident.supplier_id and lot.supplier_id != incident.supplier_id:
+            continue
+        if mode == "exact" and lot.first_build_date == first and lot.last_build_date == last:
+            matched.append(lot)
+        elif mode == "point" and lot.first_build_date <= first <= lot.last_build_date:
+            matched.append(lot)
+    if not matched:
+        raise ResolveError("no lot matches part, plant, and date evidence")
+    if len(matched) > 1:
+        raise ResolveError("ambiguous lot match")
+    return _resolved_lot(index, matched[0], ontology)
+
+
+def _confirm_lot(lot, incident: QualityHoldInput) -> None:
+    if incident.part_id and incident.part_id != lot.part_id:
+        raise ResolveError("part_id contradicts lot")
+    if incident.supplier_id and incident.supplier_id != lot.supplier_id:
+        raise ResolveError("supplier_id contradicts lot")
+    if incident.plant_id and incident.plant_id != lot.plant_id:
+        raise ResolveError("plant_id contradicts lot")
+    if incident.first_build_date or incident.last_build_date or incident.build_date:
+        mode, first, last = _quality_dates(incident)
+        if mode == "exact" and (lot.first_build_date != first or lot.last_build_date != last):
+            raise ResolveError("date evidence contradicts lot")
+        if mode == "point" and not lot.first_build_date <= first <= lot.last_build_date:
+            raise ResolveError("build_date is outside the lot window")
+
+
+def _quality_dates(incident: QualityHoldInput) -> tuple[str, date, date | None]:
+    has_first = incident.first_build_date is not None
+    has_last = incident.last_build_date is not None
+    if has_first != has_last:
+        raise ResolveError("date evidence must include both first_build_date and last_build_date")
+    if has_first and incident.first_build_date > incident.last_build_date:
+        raise ResolveError("last_build_date is before first_build_date")
+    if incident.build_date and has_first:
+        if not incident.first_build_date <= incident.build_date <= incident.last_build_date:
+            raise ResolveError("build_date is outside the supplied lot window")
+    if has_first:
+        return "exact", incident.first_build_date, incident.last_build_date
+    if incident.build_date:
+        return "point", incident.build_date, None
+    raise ResolveError("date evidence must be a build_date or both first_build_date and last_build_date")
+
+
+def _resolved_lot(index: int, lot, ontology: Ontology) -> ResolvedQuality:
+    return ResolvedQuality(
+        index,
+        lot.lot_id,
+        lot.part_id,
+        lot.supplier_id,
+        lot.plant_id,
+        lot.first_build_date,
+        lot.last_build_date,
+        ontology.models_using(lot.part_id),
+    )
+
+
 def _classify(
-    ontology: Ontology, incidents: list[Resolved]
+    ontology: Ontology, incidents: list[Schedule]
 ) -> tuple[list[dict], dict[int, list[str]], list[str]]:
     findings: list[dict] = []
     affected: dict[int, list[str]] = {incident.index: [] for incident in incidents}
@@ -257,7 +352,7 @@ def _classify(
     return findings, affected, sorted(set(after_horizon))
 
 
-def _reason(ontology: Ontology, incident: Resolved, order) -> str:
+def _reason(ontology: Ontology, incident: Schedule, order) -> str:
     if isinstance(incident, ResolvedDelay):
         if order.plant_id != incident.plant_id:
             return "wrong_plant"
@@ -279,7 +374,7 @@ def _reason(ontology: Ontology, incident: Resolved, order) -> str:
     return "affected"
 
 
-def _merge(affected_by_incident: dict[int, list[str]], incidents: list[Resolved]) -> dict[str, dict]:
+def _merge(affected_by_incident: dict[int, list[str]], incidents: list[Schedule]) -> dict[str, dict]:
     by_index = {incident.index: incident for incident in incidents}
     merged: dict[str, dict] = {}
     for index, order_ids in affected_by_incident.items():
@@ -453,6 +548,29 @@ def _tool_calls(event_id: str, moves: list[dict], notices: list[dict], decisions
     return calls
 
 
+def _quality_calls(event_id: str, holds: list[dict], stop_sales: list[dict], notices: list[dict]) -> list[dict]:
+    calls = []
+    for hold in holds:
+        calls.append({"event_id": event_id, "tool": "quality.hold_lot", "args": {"lot_id": hold["lot_id"]}})
+    for stop in stop_sales:
+        calls.append(
+            {
+                "event_id": event_id,
+                "tool": "dealer.stop_sale",
+                "args": {"dealer_id": stop["dealer_id"], "vins": stop["vins"]},
+            }
+        )
+    for notice in notices:
+        calls.append(
+            {
+                "event_id": event_id,
+                "tool": "crm.notify_customer",
+                "args": {"customer_id": notice["customer_id"], "message": QUALITY_MESSAGE},
+            }
+        )
+    return calls
+
+
 def _check_invariants(tool_calls: list[dict], affected_ids: list[str]) -> None:
     moved = [call["args"]["production_order_id"] for call in tool_calls if call["tool"] in MOVE_TOOLS]
     if len(moved) != len(set(moved)) or set(moved) != set(affected_ids):
@@ -463,6 +581,88 @@ def _check_invariants(tool_calls: list[dict], affected_ids: list[str]) -> None:
     loaners = [call["args"]["customer_order_id"] for call in tool_calls if call["tool"] == "crm.assign_loaner"]
     if len(loaners) != len(set(loaners)):
         raise RuntimeError("duplicate loaner assignment")
+    lots = [call["args"]["lot_id"] for call in tool_calls if call["tool"] == "quality.hold_lot"]
+    if len(lots) != len(set(lots)):
+        raise RuntimeError("duplicate lot hold")
+    stop_dealers = [call["args"]["dealer_id"] for call in tool_calls if call["tool"] == "dealer.stop_sale"]
+    vins = [vin for call in tool_calls if call["tool"] == "dealer.stop_sale" for vin in call["args"]["vins"]]
+    if len(stop_dealers) != len(set(stop_dealers)) or len(vins) != len(set(vins)):
+        raise RuntimeError("duplicate stop-sale")
+    owners = [call["args"]["customer_id"] for call in tool_calls if call["tool"] == "crm.notify_customer"]
+    if len(owners) != len(set(owners)):
+        raise RuntimeError("duplicate customer notice")
+
+
+def _classify_quality(ontology: Ontology, incidents: list[ResolvedQuality]):
+    findings = []
+    hits: dict[int, list] = {incident.index: [] for incident in incidents}
+    blockers = []
+    vehicles = sorted(ontology.vehicles.values(), key=lambda vehicle: vehicle.vin)
+    blocking = {"inconsistent_record", "missing_owner", "unknown_status"}
+    for incident in incidents:
+        for vehicle in vehicles:
+            reason = _vehicle_reason(ontology, incident, vehicle)
+            findings.append(
+                {
+                    "incident_index": incident.index,
+                    "vin": vehicle.vin,
+                    "production_order_id": vehicle.production_order_id,
+                    "reason": reason,
+                }
+            )
+            if reason in {"affected_in_stock", "affected_sold"}:
+                hits[incident.index].append(vehicle)
+            elif reason in blocking:
+                blockers.append(f"incidents[{incident.index}]: {reason} for {vehicle.vin}")
+    return findings, hits, blockers
+
+
+def _vehicle_reason(ontology: Ontology, incident: ResolvedQuality, vehicle) -> str:
+    if vehicle.plant_id != incident.plant_id:
+        return "wrong_plant"
+    if vehicle.build_date < incident.first_build_date or vehicle.build_date > incident.last_build_date:
+        return "outside_lot_dates"
+    order = ontology.orders[vehicle.production_order_id]
+    if order.plant_id != vehicle.plant_id or order.model != vehicle.model or order.build_date != vehicle.build_date:
+        return "inconsistent_record"
+    if order.model not in ontology.part_models.get(incident.part_id, frozenset()):
+        return "bom_miss"
+    if vehicle.status == "in_stock":
+        return "affected_in_stock"
+    if vehicle.status == "sold":
+        if not vehicle.customer_id or vehicle.customer_id not in ontology.customers:
+            return "missing_owner"
+        return "affected_sold"
+    return "unknown_status"
+
+
+def _assemble_quality(qualities: list[ResolvedQuality], hits: dict[int, list]):
+    holds = [{"lot_id": incident.lot_id} for incident in sorted(qualities, key=lambda item: item.lot_id)]
+    # One hold per lot even when two incidents name it.
+    seen_lots = []
+    unique_holds = []
+    for hold in holds:
+        if hold["lot_id"] in seen_lots:
+            continue
+        seen_lots.append(hold["lot_id"])
+        unique_holds.append(hold)
+    by_dealer: dict[str, list[str]] = defaultdict(list)
+    owners: dict[str, str] = {}
+    seen_vins = set()
+    for incident in qualities:
+        for vehicle in hits.get(incident.index, []):
+            if vehicle.vin in seen_vins:
+                continue
+            seen_vins.add(vehicle.vin)
+            if vehicle.status == "in_stock":
+                by_dealer[vehicle.dealer_id].append(vehicle.vin)
+            else:
+                owners.setdefault(vehicle.customer_id, vehicle.vin)
+    stop_sales = [
+        {"dealer_id": dealer_id, "vins": sorted(vins)} for dealer_id, vins in sorted(by_dealer.items())
+    ]
+    customer_notices = [{"customer_id": customer_id} for customer_id in sorted(owners)]
+    return unique_holds, stop_sales, customer_notices
 
 
 def _affected_payload(ontology: Ontology, constraints: dict[str, dict]) -> list[dict]:
@@ -485,14 +685,35 @@ def _affected_payload(ontology: Ontology, constraints: dict[str, dict]) -> list[
     return rows
 
 
-def _graphs(ontology: Ontology, incidents: list[Resolved], affected_by_incident: dict[int, list[str]]) -> list[dict]:
+def _graphs(
+    ontology: Ontology,
+    incidents: list[Resolved],
+    affected_by_incident: dict[int, list[str]],
+    quality_hits: dict[int, list] | None = None,
+) -> list[dict]:
+    quality_hits = quality_hits or {}
     graphs = []
     for incident in incidents:
+        chains: list[list[str]] = []
+        if isinstance(incident, ResolvedQuality):
+            for vehicle in quality_hits.get(incident.index, []):
+                chain = [
+                    f"Lot:{incident.lot_id}",
+                    f"ProductionOrder:{vehicle.production_order_id}",
+                    f"Vehicle:{vehicle.vin}",
+                    f"Dealer:{vehicle.dealer_id}",
+                ]
+                if vehicle.status == "sold":
+                    chain.append(f"Customer:{vehicle.customer_id}")
+                chains.append(chain)
+            graphs.append(
+                {"incident_index": incident.index, "kind": "quality_hold", "chains": chains, "edges": _edges(chains)}
+            )
+            continue
         order_ids = sorted(
             affected_by_incident.get(incident.index, []),
             key=lambda oid: (ontology.orders[oid].build_date, oid),
         )
-        chains: list[list[str]] = []
         if isinstance(incident, ResolvedDelay):
             kind = "supplier_delay"
         else:
@@ -546,6 +767,18 @@ def _edges(chains: list[list[str]]) -> list[list[str]]:
 
 
 def _incident_dict(incident: Resolved) -> dict:
+    if isinstance(incident, ResolvedQuality):
+        return {
+            "index": incident.index,
+            "kind": "quality_hold",
+            "lot_id": incident.lot_id,
+            "part_id": incident.part_id,
+            "supplier_id": incident.supplier_id,
+            "plant_id": incident.plant_id,
+            "first_build_date": incident.first_build_date.isoformat(),
+            "last_build_date": incident.last_build_date.isoformat(),
+            "bom_models": list(incident.bom_models),
+        }
     if isinstance(incident, ResolvedDelay):
         return {
             "index": incident.index,
@@ -582,6 +815,8 @@ def _result(
     graphs: list[dict],
     notes: list[str],
     tool_calls: list[dict] | None = None,
+    vehicle_findings: list[dict] | None = None,
+    quality: dict | None = None,
 ) -> dict:
     return {
         "schema_version": SCHEMA_VERSION,
@@ -593,8 +828,10 @@ def _result(
         "incidents": [_incident_dict(incident) for incident in incidents],
         "affected_orders": affected_orders,
         "findings": findings,
+        "vehicle_findings": vehicle_findings or [],
         "moves": moves,
         "loaner_decisions": decisions,
+        "quality": quality or {"holds": [], "stop_sales": [], "customer_notices": []},
         "graph_paths": graphs,
         "tool_calls": tool_calls or [],
     }

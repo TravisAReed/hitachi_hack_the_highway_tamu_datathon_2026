@@ -106,6 +106,55 @@ class EnterpriseAgreementTests(unittest.TestCase):
                     self.assertEqual(state["notified"][call["args"]["dealer_id"]], set(call["args"]["customer_order_ids"]))
         self.assertEqual(hash_data(), DATA_HASH)
 
+    def test_quality_hold_and_mixed_delay_match_simulator_state(self):
+        start = date(2027, 2, 26)
+        end = date(2027, 3, 1)
+        company = (
+            Company()
+            .add_supplier("SUP")
+            .add_plant("PA", 5, ["CAR", "VAN"])
+            .add_part("BAT", ["CAR"])
+            .add_shipment("SH-1", "SUP", "BAT", "PA", MON)
+            .add_dealer("D1", 1)
+            .add_customer("CU-P", "Platinum")
+            .add_customer("CU-OWN", "Gold")
+            .add_lot("LOT-1", "BAT", "SUP", "PA", start, end)
+            .add_order("PO-OLD", "PA", start, "CAR")
+            .add_order("PO-END", "PA", end, "CAR")
+            .add_order("PO-OUT", "PA", date(2027, 2, 25), "CAR")
+            .add_order("PO-MOVE", "PA", MON, "CAR")
+            .add_customer_order("CO-P", "PO-MOVE", "D1", "CU-P", "CAR", date(2027, 3, 20))
+            .add_vehicle("VIN-SOLD", "PO-OLD", "CAR", "PA", start, "D1", "sold", "CU-OWN")
+            .add_vehicle("VIN-STOCK", "PO-END", "CAR", "PA", end, "D1", "in_stock")
+            .add_vehicle("VIN-OUT", "PO-OUT", "CAR", "PA", date(2027, 2, 25), "D1", "in_stock")
+        )
+        event = {
+            "event_id": "mem-mixed",
+            "incidents": [
+                {"kind": "supplier_delay", "shipment_id": "SH-1", "new_eta": "2027-03-10"},
+                {"kind": "quality_hold", "lot_id": "LOT-1"},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            company.write(root)
+            result = plan_event(load_ontology(root), event)
+            self.assertEqual(result["status"], "ok", result["blockers"])
+            world = enterprise.Enterprise(str(root))
+            for call in result["tool_calls"]:
+                self.assertEqual(set(call["args"]), set(enterprise.TOOLS[call["tool"]]["args"]))
+                world.call(event["event_id"], call["tool"], call["args"])
+            state = world.state(event["event_id"])
+            self.assertEqual(state["loc"]["PO-MOVE"], ("PA", enterprise.date_to_idx(date(2027, 3, 10))))
+            self.assertNotIn("PO-OLD", state["loc"])
+            self.assertEqual(state["held"], {"LOT-1"})
+            self.assertEqual(state["stopped"], {"VIN-STOCK"})
+            self.assertEqual(state["customers"], {"CU-OWN"})
+            self.assertEqual(state["loaned"], {"CO-P"})
+            self.assertEqual(state["notified"]["D1"], {"CO-P"})
+            self.assertFalse(state["escalated"])
+        self.assertEqual(hash_data(), DATA_HASH)
+
 
 if __name__ == "__main__":
     unittest.main()

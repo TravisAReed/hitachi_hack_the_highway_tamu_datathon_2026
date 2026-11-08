@@ -42,6 +42,27 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["incidents"][0]["covers_days"], 99)
         self.assertNotIn("CO-U", notices[0]["args"]["customer_order_ids"])
 
+    def test_quality_demo_command(self):
+        completed = subprocess.run(
+            [sys.executable, "-m", "solution.hth.dry_run", "--demo-quality"],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        payload = json.loads(completed.stdout)
+        self.assertEqual(payload["event_id"], "demo-quality")
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["tool_calls"][0]["tool"], "quality.hold_lot")
+        stops = [call for call in payload["tool_calls"] if call["tool"] == "dealer.stop_sale"]
+        self.assertEqual(stops[0]["args"]["vins"], ["VIN-STOCK"])
+        owners = [call["args"]["customer_id"] for call in payload["tool_calls"] if call["tool"] == "crm.notify_customer"]
+        self.assertEqual(owners, ["CU-OWN"])
+        reasons = {row["vin"]: row["reason"] for row in payload["vehicle_findings"]}
+        self.assertEqual(reasons["VIN-VAN"], "bom_miss")
+        self.assertEqual(reasons["VIN-OTHER"], "wrong_plant")
+
     def test_output_inside_data_dir_is_refused(self):
         data = ROOT / "hack_the_highway_student_package" / "hack_the_highway_package" / "data"
         with tempfile.TemporaryDirectory() as tmp:

@@ -428,17 +428,12 @@ class FailClosedTests(unittest.TestCase):
         )
         self.assertIn("end_date is before start_date", backwards["blockers"][0])
 
-    def test_quality_hold_and_unknown_fields_are_rejected(self):
+    def test_unknown_fields_are_rejected(self):
+        ontology = week_company().add_plant("PA", 1, ["CAR"]).ontology()
         with self.assertRaises(InputError):
-            plan_event(
-                week_company().add_plant("PA", 1, ["CAR"]).ontology(),
-                {"event_id": "q", "incidents": [{"kind": "quality_hold", "lot_id": "LOT-X"}]},
-            )
+            plan_event(ontology, {"event_id": "extra", "incidents": [], "note": "nope"})
         with self.assertRaises(InputError):
-            plan_event(
-                week_company().add_plant("PA", 1, ["CAR"]).ontology(),
-                {"event_id": "extra", "incidents": [], "note": "nope"},
-            )
+            plan_event(ontology, {"event_id": "q", "incidents": [{"kind": "quality_hold", "lot_id": "LOT-X", "note": "x"}]})
 
     def test_one_invalid_incident_withholds_the_valid_one(self):
         company = (

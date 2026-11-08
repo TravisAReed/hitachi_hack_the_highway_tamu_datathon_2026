@@ -112,6 +112,44 @@ class Company:
         )
         return self
 
+    def add_lot(self, lot_id: str, part_id: str, supplier_id: str, plant_id: str, first: date, last: date) -> Company:
+        self.lots.append(
+            {
+                "lot_id": lot_id,
+                "part_id": part_id,
+                "supplier_id": supplier_id,
+                "plant_id": plant_id,
+                "first_build_date": first.isoformat(),
+                "last_build_date": last.isoformat(),
+            }
+        )
+        return self
+
+    def add_vehicle(
+        self,
+        vin: str,
+        production_order_id: str,
+        model: str,
+        plant_id: str,
+        build: date,
+        dealer_id: str,
+        status: str,
+        customer_id: str = "",
+    ) -> Company:
+        self.vehicles.append(
+            {
+                "vin": vin,
+                "production_order_id": production_order_id,
+                "model": model,
+                "plant_id": plant_id,
+                "build_date": build.isoformat(),
+                "dealer_id": dealer_id,
+                "status": status,
+                "customer_id": customer_id,
+            }
+        )
+        return self
+
     def add_customer_order(
         self,
         customer_order_id: str,

@@ -96,3 +96,97 @@ def build_demo():
         "incidents": [{"kind": "supplier_delay", "shipment_id": "SH-DEMO", "new_eta": "2027-03-10"}],
     }
     return build_ontology(tables, HORIZON), event
+
+
+def build_quality_demo():
+    """Return a fictional quality hold with one sold owner and one unsold vehicle."""
+    tables = {
+        "plants.csv": [
+            {"plant_id": "PA", "name": "Plant A", "city": "A", "slots_per_day": "5"},
+            {"plant_id": "PB", "name": "Plant B", "city": "B", "slots_per_day": "5"},
+        ],
+        "plant_models.csv": [
+            {"plant_id": "PA", "model": "CAR"},
+            {"plant_id": "PA", "model": "VAN"},
+            {"plant_id": "PB", "model": "CAR"},
+        ],
+        "models.csv": [{"model": "CAR", "segment": ""}, {"model": "VAN", "segment": ""}],
+        "parts.csv": [{"part_id": "BAT", "name": "battery", "category": ""}],
+        "bom.csv": [{"model": "CAR", "part_id": "BAT"}],
+        "suppliers.csv": [{"supplier_id": "SUP", "name": "Supplier", "city": ""}],
+        "dealers.csv": [
+            {"dealer_id": "D1", "name": "Dealer", "city": "", "region": "", "transit_days": ""},
+            {"dealer_id": "D2", "name": "Other", "city": "", "region": "", "transit_days": ""},
+        ],
+        "customers.csv": [
+            {"customer_id": "CU-OWN", "name": "Owen", "tier": "Gold"},
+            {"customer_id": "CU-ELSE", "name": "Else", "tier": "Standard"},
+        ],
+        "loaners.csv": [
+            {"dealer_id": "D1", "loaners_available": "1"},
+            {"dealer_id": "D2", "loaners_available": "1"},
+        ],
+        "production_orders.csv": [
+            {"production_order_id": "PO-MON", "plant_id": "PA", "build_date": "2027-02-22", "model": "CAR", "units": "2"},
+            {"production_order_id": "PO-WED", "plant_id": "PA", "build_date": "2027-02-24", "model": "CAR", "units": "1"},
+            {"production_order_id": "PO-VAN", "plant_id": "PA", "build_date": "2027-02-22", "model": "VAN", "units": "1"},
+            {"production_order_id": "PO-PB", "plant_id": "PB", "build_date": "2027-02-22", "model": "CAR", "units": "1"},
+        ],
+        "part_lots.csv": [
+            {
+                "lot_id": "LOT-DEMO",
+                "part_id": "BAT",
+                "supplier_id": "SUP",
+                "plant_id": "PA",
+                "first_build_date": "2027-02-22",
+                "last_build_date": "2027-02-24",
+            }
+        ],
+        "finished_vehicles.csv": [
+            {
+                "vin": "VIN-SOLD",
+                "production_order_id": "PO-MON",
+                "model": "CAR",
+                "plant_id": "PA",
+                "build_date": "2027-02-22",
+                "dealer_id": "D1",
+                "status": "sold",
+                "customer_id": "CU-OWN",
+            },
+            {
+                "vin": "VIN-STOCK",
+                "production_order_id": "PO-WED",
+                "model": "CAR",
+                "plant_id": "PA",
+                "build_date": "2027-02-24",
+                "dealer_id": "D2",
+                "status": "in_stock",
+                "customer_id": "",
+            },
+            {
+                "vin": "VIN-VAN",
+                "production_order_id": "PO-VAN",
+                "model": "VAN",
+                "plant_id": "PA",
+                "build_date": "2027-02-22",
+                "dealer_id": "D1",
+                "status": "in_stock",
+                "customer_id": "",
+            },
+            {
+                "vin": "VIN-OTHER",
+                "production_order_id": "PO-PB",
+                "model": "CAR",
+                "plant_id": "PB",
+                "build_date": "2027-02-22",
+                "dealer_id": "D2",
+                "status": "sold",
+                "customer_id": "CU-ELSE",
+            },
+        ],
+    }
+    event = {
+        "event_id": "demo-quality",
+        "incidents": [{"kind": "quality_hold", "lot_id": "LOT-DEMO"}],
+    }
+    return build_ontology(tables), event

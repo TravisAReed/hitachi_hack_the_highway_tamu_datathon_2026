@@ -437,6 +437,8 @@ class Ontology:
                 raise OntologyError(f"lot {lid} references unknown plant {pid}")
             first = _parse_date("part_lots.csv", _cell("part_lots.csv", row, "first_build_date"), "first_build_date")
             last = _parse_date("part_lots.csv", _cell("part_lots.csv", row, "last_build_date"), "last_build_date")
+            if last < first:
+                raise OntologyError(f"lot {lid} last_build_date is before first_build_date")
             self.lots[lid] = Lot(lid, part_id, supplier, pid, first, last)
             self._index_name(lid, "lot", lid)
 

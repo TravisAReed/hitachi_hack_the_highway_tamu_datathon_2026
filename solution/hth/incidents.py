@@ -12,6 +12,9 @@ DELAY_FIELDS = frozenset(
     {"kind", "shipment_id", "supplier_id", "part_id", "plant_id", "original_eta", "new_eta"}
 )
 OUTAGE_FIELDS = frozenset({"kind", "plant_id", "start_date", "end_date"})
+QUALITY_FIELDS = frozenset(
+    {"kind", "lot_id", "part_id", "supplier_id", "plant_id", "first_build_date", "last_build_date", "build_date"}
+)
 EVENT_FIELDS = frozenset({"event_id", "incidents"})
 
 
@@ -37,9 +40,20 @@ class PlantOutageInput:
 
 
 @dataclass(frozen=True)
+class QualityHoldInput:
+    lot_id: str | None
+    part_id: str | None
+    supplier_id: str | None
+    plant_id: str | None
+    first_build_date: date | None
+    last_build_date: date | None
+    build_date: date | None
+
+
+@dataclass(frozen=True)
 class EventInput:
     event_id: str
-    incidents: tuple[SupplierDelayInput | PlantOutageInput, ...]
+    incidents: tuple[SupplierDelayInput | PlantOutageInput | QualityHoldInput, ...]
 
 
 def _optional_id(payload: dict, field: str) -> str | None:
@@ -85,13 +99,13 @@ def parse_event(payload: object) -> EventInput:
     raw_incidents = payload.get("incidents")
     if not isinstance(raw_incidents, list):
         raise InputError("incidents must be a list")
-    incidents: list[SupplierDelayInput | PlantOutageInput] = []
+    incidents: list[SupplierDelayInput | PlantOutageInput | QualityHoldInput] = []
     for index, item in enumerate(raw_incidents):
         incidents.append(_parse_incident(index, item))
     return EventInput(event_id.strip(), tuple(incidents))
 
 
-def _parse_incident(index: int, item: object) -> SupplierDelayInput | PlantOutageInput:
+def _parse_incident(index: int, item: object) -> SupplierDelayInput | PlantOutageInput | QualityHoldInput:
     if not isinstance(item, dict):
         raise InputError(f"incidents[{index}] must be an object")
     kind = item.get("kind")
@@ -120,5 +134,16 @@ def _parse_incident(index: int, item: object) -> SupplierDelayInput | PlantOutag
         assert start is not None and end is not None
         return PlantOutageInput(_required_str(item, "plant_id"), start, end)
     if kind == "quality_hold":
-        raise InputError("quality_hold is not accepted by this dry-run; omit it until that milestone")
+        extra = set(item) - QUALITY_FIELDS
+        if extra:
+            raise InputError(f"incidents[{index}] has unknown fields {sorted(extra)}")
+        return QualityHoldInput(
+            _optional_id(item, "lot_id"),
+            _optional_id(item, "part_id"),
+            _optional_id(item, "supplier_id"),
+            _optional_id(item, "plant_id"),
+            _parse_date(item, "first_build_date", required=False),
+            _parse_date(item, "last_build_date", required=False),
+            _parse_date(item, "build_date", required=False),
+        )
     raise InputError(f"incidents[{index}].kind {kind!r} is not supported")
