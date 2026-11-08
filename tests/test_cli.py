@@ -63,6 +63,44 @@ class CliTests(unittest.TestCase):
         self.assertEqual(reasons["VIN-VAN"], "bom_miss")
         self.assertEqual(reasons["VIN-OTHER"], "wrong_plant")
 
+    def test_stub_parse_demo_is_not_a_live_model_run(self):
+        completed = subprocess.run(
+            [sys.executable, "-m", "solution.hth.dry_run", "--demo-parse"],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        payload = json.loads(completed.stdout)
+        self.assertEqual(payload["interpretation"]["mode"], "stub")
+        self.assertFalse(payload["interpretation"]["llm_invoked"])
+        self.assertIsNone(payload["interpretation"]["model"])
+        self.assertTrue(any(call["tool"] == "mes.reschedule" for call in payload["tool_calls"]))
+        self.assertNotIn("live", payload["interpretation"]["mode"])
+
+    def test_free_text_without_a_parser_is_rejected(self):
+        data = ROOT / "hack_the_highway_student_package" / "hack_the_highway_package" / "data"
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "solution.hth.dry_run",
+                "--data",
+                str(data),
+                "--text",
+                "hello",
+                "--event-id",
+                "local",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("no heuristic fallback", completed.stderr)
+
     def test_output_inside_data_dir_is_refused(self):
         data = ROOT / "hack_the_highway_student_package" / "hack_the_highway_package" / "data"
         with tempfile.TemporaryDirectory() as tmp:

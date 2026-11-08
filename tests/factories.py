@@ -66,6 +66,10 @@ class Company:
             self.bom.append({"model": model, "part_id": part_id})
         return self
 
+    def add_alias(self, alias: str, entity_type: str, entity_id: str) -> Company:
+        self.aliases.append({"alias": alias, "entity_type": entity_type, "entity_id": entity_id})
+        return self
+
     def add_supplier(self, supplier_id: str) -> Company:
         self.suppliers.append({"supplier_id": supplier_id, "name": supplier_id, "city": ""})
         return self

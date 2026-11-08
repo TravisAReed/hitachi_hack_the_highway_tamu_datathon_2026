@@ -98,6 +98,45 @@ def build_demo():
     return build_ontology(tables, HORIZON), event
 
 
+PARSE_TEXT = "Plant update: Huntsville line is dark from next Tuesday through next Thursday."
+
+
+def build_parse_demo():
+    """Fictional outage text plus a labeled stub extraction. Not a live model call."""
+    tables = {
+        "plants.csv": [{"plant_id": "PA", "name": "Plant A", "city": "A", "slots_per_day": "5"}],
+        "plant_models.csv": [{"plant_id": "PA", "model": "CAR"}],
+        "models.csv": [{"model": "CAR", "segment": ""}],
+        "parts.csv": [{"part_id": "BAT", "name": "battery", "category": ""}],
+        "bom.csv": [{"model": "CAR", "part_id": "BAT"}],
+        "suppliers.csv": [{"supplier_id": "SUP", "name": "Supplier", "city": ""}],
+        "dealers.csv": [{"dealer_id": "D1", "name": "Dealer", "city": "", "region": "", "transit_days": ""}],
+        "customers.csv": [{"customer_id": "CU-1", "name": "Casey", "tier": "Standard"}],
+        "loaners.csv": [{"dealer_id": "D1", "loaners_available": "1"}],
+        "production_orders.csv": [
+            {"production_order_id": "PO-TUE", "plant_id": "PA", "build_date": "2027-03-09", "model": "CAR", "units": "1"},
+            {"production_order_id": "PO-WED", "plant_id": "PA", "build_date": "2027-03-10", "model": "CAR", "units": "1"},
+            {"production_order_id": "PO-THU", "plant_id": "PA", "build_date": "2027-03-11", "model": "CAR", "units": "1"},
+        ],
+        "aliases.csv": [{"alias": "Huntsville", "entity_type": "plant", "entity_id": "PA"}],
+    }
+    stub = {
+        "incidents": [
+            {
+                "category": "plant_outage",
+                "confirmed": True,
+                "evidence_quotes": ["Huntsville line is dark from next Tuesday through next Thursday"],
+                "entities": [{"role": "plant", "mention": "Huntsville line"}],
+                "dates": [
+                    {"role": "outage_start", "mention": "next Tuesday"},
+                    {"role": "outage_end", "mention": "next Thursday"},
+                ],
+            }
+        ]
+    }
+    return build_ontology(tables, HORIZON), "demo-parse", PARSE_TEXT, stub
+
+
 def build_quality_demo():
     """Return a fictional quality hold with one sold owner and one unsold vehicle."""
     tables = {

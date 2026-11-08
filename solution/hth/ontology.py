@@ -10,6 +10,7 @@ source files or calls enterprise tools.
 from __future__ import annotations
 
 import csv
+import re
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -523,6 +524,33 @@ class Ontology:
             return NameHit("not_found", matches=frozen)
         return NameHit("ambiguous", matches=frozen)
 
+    def resolve_mention(self, mention: str, entity_type: str | None = None) -> NameHit:
+        """Resolve a surface mention. Exact names win; otherwise whole-word aliases.
+
+        A shorter alias inside a longer one counts only when both name the same
+        entity. Two different entities in one mention are ambiguous. Keys shorter
+        than three characters are not used for the in-text scan.
+        """
+        exact = self.resolve_name(mention, entity_type)
+        if exact.status in {"found", "ambiguous"}:
+            return exact
+        normalized = normalize_name(mention)
+        found: set[tuple[str, str]] = set()
+        for key, matches in self.name_index.items():
+            if len(key) < 3 or not _phrase_bounded(key, normalized):
+                continue
+            for kind, entity_id in matches:
+                if entity_type is not None and kind != entity_type:
+                    continue
+                found.add((kind, entity_id))
+        frozen = tuple(sorted(found))
+        if len(frozen) == 1:
+            kind, entity_id = frozen[0]
+            return NameHit("found", kind, entity_id, frozen)
+        if not frozen:
+            return NameHit("not_found")
+        return NameHit("ambiguous", matches=frozen)
+
     def models_using(self, part_id: str) -> tuple[str, ...]:
         return tuple(sorted(self.part_models.get(part_id, ())))
 
@@ -551,6 +579,10 @@ class Ontology:
             "loaner_pools": len(self.loaners),
             "destination_days": len(self.destination_days),
         }
+
+
+def _phrase_bounded(phrase: str, text: str) -> bool:
+    return re.search(rf"(?<!\w){re.escape(phrase)}(?!\w)", text) is not None
 
 
 def _default_horizon() -> date:

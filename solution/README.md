@@ -2,7 +2,7 @@
 
 Student code for supplier delays, plant outages, and quality holds. It reads the company tables, accepts a structured incident list, and prints proposed tool calls plus graph paths. It does not start `enterprise_server.py`, does not call write tools, and does not write `action_log.jsonl`.
 
-Free-text parsing, agent orchestration, the control-tower UI, and scored execution are later milestones. `enterprise.py`, `enterprise_server.py`, and `data/` are organizer files and are not modified.
+Agent orchestration, the control-tower UI, and scored execution are later milestones. `enterprise.py`, `enterprise_server.py`, and `data/` are organizer files and are not modified.
 
 ## Run
 
@@ -11,12 +11,20 @@ From the repository root:
 ```bash
 python -m solution.hth.dry_run --demo
 python -m solution.hth.dry_run --demo-quality
+python -m solution.hth.dry_run --demo-parse
 python -m solution.hth.dry_run --check-data --data hack_the_highway_student_package/hack_the_highway_package/data
 python -m solution.hth.dry_run --data hack_the_highway_student_package/hack_the_highway_package/data --input incident.json
 python -m unittest discover -s tests -v
 ```
 
-`--demo` is a fictional delay. `--demo-quality` is a fictional quality hold. Neither is one of the 15 scored events. `--output` writes the plan JSON. The command refuses to place that file inside the company data directory.
+`--demo` is a fictional delay. `--demo-quality` is a fictional quality hold. `--demo-parse` runs a fictional sentence through a labeled stub extraction. That stub is not a live model call. None of the demos are scored events. `--output` writes the plan JSON. The command refuses to place that file inside the company data directory.
+
+Free text needs `--event-id` and `--parser stub` or `--parser live`. There is no keyword fallback if a parser is not selected. Stub mode reads `--stub-file`, a JSON extraction you wrote or saved, and records `llm_invoked: false`. Live mode reads `HTH_LLM_BASE_URL`, `HTH_LLM_MODEL`, and an optional `HTH_LLM_API_KEY`. The key is sent only as an Authorization header and is not copied into the plan. The client posts to `{HTH_LLM_BASE_URL}/chat/completions`. This repository run did not call a live model.
+
+```bash
+python -m solution.hth.dry_run --data hack_the_highway_student_package/hack_the_highway_package/data --text-file message.txt --event-id local-1 --parser stub --stub-file extraction.json
+python -m solution.hth.dry_run --data hack_the_highway_student_package/hack_the_highway_package/data --text-file message.txt --event-id local-1 --parser live
+```
 
 Exit `0` means a plan was produced. `status` is `ok` or `blocked`. Exit `2` means the input or the tables could not be read. A blocked plan has an empty `tool_calls` list.
 
@@ -51,7 +59,11 @@ Replace the example ids with ids from the tables. This shape is not a scored eve
 
 A delay may omit `shipment_id` and pass `part_id`, `plant_id`, and `original_eta` instead. Optional ids must match the shipment or the event is blocked. `new_eta` is required. Several incidents share one slot map and one loaner pool.
 
-A quality hold may pass `lot_id` alone. Any part, supplier, plant, or dates sent with it must match that lot. Without `lot_id`, pass `part_id`, `plant_id`, and either `build_date` or both `first_build_date` and `last_build_date`. Do not feed `events.json` to this command. Those messages are free text, and this milestone does not classify them.
+A quality hold may pass `lot_id` alone. Any part, supplier, plant, or dates sent with it must match that lot. Without `lot_id`, pass `part_id`, `plant_id`, and either `build_date` or both `first_build_date` and `last_build_date`. Structured `--input` does not call a model.
+
+Free-text extraction uses categories `supplier_delay`, `plant_outage`, `quality_hold`, `noise`, and `unconfirmed`. The model may return verbatim quotes and date phrases only. Code resolves aliases with whole-word matches, resolves dates from Monday 2027-03-08, and calls the same planner. The model cannot supply production-order ids, customer-order ids, or VINs. `next <weekday>` means the soonest such weekday after today, so on this Monday `next Friday` is 2027-03-12 and `next Monday` is 2027-03-15. A phrase that disagrees with itself is not planned.
+
+If any incident in one message is unconfirmed, or a quote, entity, or date does not resolve, the whole message becomes one `escalate` and no write tools. Noise-only text proposes nothing. Noise next to a resolved incident is ignored. A planner block after a clean resolution, such as no open slot, stays a block. Do not feed `events.json` to a live model from this tool unless you intend to send that text to your configured endpoint.
 
 ## What the plan contains
 
@@ -77,4 +89,4 @@ These close gaps in the handbook. Uncertain or contradictory inputs produce `sta
 
 ## Tests
 
-Synthetic companies cover window boundaries, unaffected orders, BOM and receiving-plant filters, weekdays, the tool horizon, capacity, transfers, dealer grouping, loaner rank, compound slot sharing, and quality holds (inclusive lot dates, wrong plant or model, sold versus unsold, missing owners, repeated and ambiguous lots, and a mixed delay plus quality event). Tests apply plans to an in-memory `Enterprise` loaded from a temporary copy of synthetic CSVs. The packaged `data/` directory is only read.
+Synthetic companies cover window boundaries, unaffected orders, BOM and receiving-plant filters, weekdays, the tool horizon, capacity, transfers, dealer grouping, loaner rank, compound slot sharing, and quality holds. Text tests use labeled stub extractions, not live model calls. They cover alias word boundaries, relative dates, conflicting dates, quotes missing from the text, forged order or VIN fields, noise, escalation, and a compound message that must not leak a partial write. Planner tests still apply plans to an in-memory `Enterprise` loaded from temporary CSVs. The packaged `data/` directory is only read. Live HTTP parsing is implemented and was not executed.
