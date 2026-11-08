@@ -66,6 +66,10 @@ class StandaloneHarnessTests(unittest.TestCase):
             self.assertEqual(report["guarded_mock_local_rejections"], 1)
             self.assertEqual(report["diagnostic_mock_http_attempts"], 1)
             self.assertEqual(report["diagnostic_mock_limit_origin"], "openrouter_platform")
+            self.assertTrue(report["urlopen_signature_ok"])
+            self.assertEqual(report["loopback_success_decision"], "plan")
+            self.assertEqual(report["loopback_429_limit_origin"], "openrouter_platform")
+            self.assertEqual(report["loopback_timeout"], 60)
             for name, digest in report["module_sha256"].items():
                 self.assertEqual(hashlib.sha256((PACKAGE / name).read_bytes()).hexdigest(), digest)
             local = run_evaluation(ScriptedExtractor([case["response"] for case in CASES]), 10)

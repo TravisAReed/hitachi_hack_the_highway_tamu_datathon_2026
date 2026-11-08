@@ -395,8 +395,8 @@ class QueueTransport:
         self.responses = list(responses)
         self.requests = []
 
-    def __call__(self, request, timeout):
-        del timeout
+    def __call__(self, request, data=None, timeout=None, **kwargs):
+        del data, timeout, kwargs
         self.requests.append(request)
         if not self.responses:
             raise TimeoutError("no scripted http response")

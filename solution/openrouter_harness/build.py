@@ -27,7 +27,7 @@ RUN_TEXT = """Standalone fictional OpenRouter evaluation
 Python 3.11 or newer. No extra packages. This zip does not contain challenge
 tables, events, credentials, or an enterprise client.
 
-Offline self-test. No API key and no network:
+Offline self-test. No API key. It uses 127.0.0.1 only and does not call OpenRouter:
 
     python3 hth_openrouter_eval.zip --self-test
     python3 hth_openrouter_eval.zip --self-test --output self_test.json

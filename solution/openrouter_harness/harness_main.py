@@ -6,9 +6,13 @@ import argparse
 import hashlib
 import json
 import os
+import socket
 import sys
 import urllib.request
 from pathlib import Path
+
+# Saved before a self-test replaces the global. Production calls use this signature.
+_REAL_URLOPEN = urllib.request.urlopen
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -140,6 +144,11 @@ def self_test(budget: int) -> dict:
         raise RuntimeError("platform 429 fixture was not recognized")
     report["diagnostic_mock_http_attempts"] = diagnostic["http_attempts"]
     report["diagnostic_mock_limit_origin"] = diagnostic["limit_origin"]
+    loopback = _urlopen_loopback(config, sentinel)
+    report["urlopen_signature_ok"] = True
+    report["loopback_success_decision"] = loopback["success_decision"]
+    report["loopback_429_limit_origin"] = loopback["limit_origin"]
+    report["loopback_timeout"] = loopback["timeout"]
     report["module_sha256"] = _module_hashes()
     report["live_success_claimed"] = False
     return _sanitize(report, sentinel)
@@ -180,13 +189,14 @@ def diagnose(config=None, transport=None) -> dict:
     return _sanitize(report, secret)
 
 
-def live_run(budget: int) -> dict:
+def live_run(budget: int, config=None, transport=None) -> dict:
     from hth.llm import OpenAICompatibleClient, load_openrouter_config
     from hth.openrouter_eval import run_evaluation
 
-    config = load_openrouter_config()
+    if config is None:
+        config = load_openrouter_config()
     secret = config.api_key or ""
-    client = _GuardedClient(OpenAICompatibleClient(config), _StartWindow())
+    client = _GuardedClient(OpenAICompatibleClient(config, transport=transport), _StartWindow())
     try:
         report = run_evaluation(client, budget)
     finally:
@@ -264,11 +274,12 @@ class _OneShotTransport:
         self._inner = inner
         self.calls = 0
 
-    def __call__(self, request, timeout=60):
+    def __call__(self, url, data=None, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, **kwargs):
         self.calls += 1
         if self.calls > 1:
             raise RuntimeError("diagnostic network cap exceeded")
-        return self._inner(request, timeout)
+        # urlopen's second positional parameter is data, not timeout.
+        return self._inner(url, data=data, timeout=timeout, **kwargs)
 
 
 class _StartWindow:
@@ -305,6 +316,109 @@ class _GuardedClient:
         return getattr(self._inner, name)
 
 
+def _urlopen_loopback(config, sentinel: str) -> dict:
+    """Drive production live and diagnose through urllib.request.urlopen to 127.0.0.1."""
+    del config
+    import tempfile
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from hth.llm import OPENROUTER_MODEL, LlmConfig, build_chat_request
+    from hth.openrouter_eval import CASES
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            self.server.bodies.append(self.rfile.read(length))
+            status, payload, extra = self.server.queue.pop(0)
+            raw = json.dumps(payload).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Connection", "close")
+            for key, value in extra.items():
+                self.send_header(key, value)
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def log_message(self, fmt, *args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.bodies = []
+    server.queue = [
+        (
+            200,
+            {
+                "model": OPENROUTER_MODEL,
+                "provider": "Phala",
+                "choices": [{"message": {"content": json.dumps(CASES[0]["response"])}}],
+            },
+            {},
+        ),
+        (
+            429,
+            {
+                "id": "gen-loopback1",
+                "error": {
+                    "code": 429,
+                    "message": "Rate limit exceeded",
+                    "metadata": {"error_type": "rate_limit_exceeded"},
+                },
+            },
+            {
+                "X-RateLimit-Limit": "50",
+                "X-RateLimit-Remaining": "0",
+                "X-RateLimit-Reset": "1762646400000",
+                "Retry-After": "60",
+                "Set-Cookie": "session=secret",
+            },
+        ),
+    ]
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    seen = []
+
+    def spy(url, data=None, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, *args, **kwargs):
+        host = getattr(url, "full_url", "")
+        seen.append({"data": data, "timeout": timeout, "body": getattr(url, "data", None), "url": host})
+        if data is not None or timeout != 60 or not str(host).startswith("http://127.0.0.1:"):
+            raise RuntimeError("urlopen signature drift")
+        return _REAL_URLOPEN(url, data=data, timeout=timeout, *args, **kwargs)
+
+    local = LlmConfig(f"http://127.0.0.1:{port}/api/v1", OPENROUTER_MODEL, sentinel, route="openrouter")
+    expected = json.dumps(build_chat_request(local, CASES[0]["text"]).body).encode("utf-8")
+    try:
+        success = live_run(1, local, spy)
+        limited = diagnose(local, spy)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+    if len(server.bodies) != 2 or server.bodies != [expected, expected]:
+        raise RuntimeError("request body bytes changed before the local server")
+    if len(seen) != 2 or any(item["body"] != expected or item["timeout"] != 60 or item["data"] is not None for item in seen):
+        raise RuntimeError("urlopen signature drift")
+    if success["http_attempts"] != 1 or success["results"][0]["decision"] != "plan":
+        raise RuntimeError("loopback success did not plan the fictional delay")
+    if limited["http_attempts"] != 1 or limited["completions"] != 0 or limited["limit_origin"] != "openrouter_platform":
+        raise RuntimeError("loopback 429 was not captured")
+    directory = Path(tempfile.mkdtemp(prefix="hth-loopback-"))
+    success_path = directory / "success.json"
+    limit_path = directory / "rate_limit.json"
+    if _emit(success, success_path) != 0 or _emit(limited, limit_path) != 0:
+        raise RuntimeError("loopback report was not written")
+    blob = success_path.read_text(encoding="utf-8") + limit_path.read_text(encoding="utf-8")
+    if sentinel in blob or "session=secret" in blob:
+        raise RuntimeError("loopback report kept a credential")
+    saved_success = json.loads(success_path.read_text(encoding="utf-8"))
+    saved_limit = json.loads(limit_path.read_text(encoding="utf-8"))
+    if saved_success["results"][0]["decision"] != "plan" or saved_limit["results"][0].get("http_status") != 429:
+        raise RuntimeError("written loopback JSON drifted")
+    return {"success_decision": "plan", "limit_origin": saved_limit["limit_origin"], "timeout": seen[0]["timeout"]}
+
+
 def _diagnose_mock(config, sentinel: str) -> dict:
     from email.message import Message
     from io import BytesIO
@@ -332,8 +446,10 @@ def _diagnose_mock(config, sentinel: str) -> dict:
     headers["Set-Cookie"] = "session=secret"
     headers["Authorization"] = "Bearer " + sentinel
 
-    def transport(request, timeout):
-        del timeout
+    def transport(request, data=None, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, **kwargs):
+        del kwargs
+        if data is not None or timeout != 60:
+            raise RuntimeError("diagnostic transport was not called with the urlopen signature")
         transport.requests.append(request)
         raise HTTPError(request.full_url, 429, "Too Many Requests", headers, BytesIO(body))
 
@@ -471,6 +587,10 @@ def _summary(output: Path, cleaned: dict) -> dict:
     if "diagnostic_mock_http_attempts" in cleaned:
         summary["diagnostic_mock_http_attempts"] = cleaned["diagnostic_mock_http_attempts"]
         summary["diagnostic_mock_limit_origin"] = cleaned.get("diagnostic_mock_limit_origin")
+    if cleaned.get("urlopen_signature_ok"):
+        summary["urlopen_signature_ok"] = True
+        summary["loopback_success_decision"] = cleaned.get("loopback_success_decision")
+        summary["loopback_429_limit_origin"] = cleaned.get("loopback_429_limit_origin")
     if cleaned.get("diagnostic"):
         summary["diagnostic"] = True
         summary["completions"] = cleaned.get("completions")
