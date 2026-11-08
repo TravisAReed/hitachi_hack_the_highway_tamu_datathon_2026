@@ -150,6 +150,7 @@ class FictionalEvaluationTests(unittest.TestCase):
         live = OpenAICompatibleClient(config, transport=transport)
         stopped = run_evaluation(live, budget=10)
         self.assertEqual(stopped["calls"], 1)
+        self.assertEqual(stopped["http_attempts"], 1)
         self.assertEqual(stopped["aborted"], "auth")
         self.assertEqual(live.attempts, 1)
         self.assertFalse(stopped["live_success_claimed"])

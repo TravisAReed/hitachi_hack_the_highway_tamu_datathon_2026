@@ -39,10 +39,14 @@ reads os.environ and does not print the key or request headers.
     python3 hth_openrouter_eval.zip --live --confirm-free-quota --output eval_result.json
 
 Limits: model xingchen-agi/xing4.0-29b-a4b:free, Phala only, strict JSON schema,
-data_collection deny, no model fallback, at most 10 calls, one attempt each,
-sequential and under 20 starts in any 60 seconds. Auth, payment, quota, and a
-provider or model mismatch abort the suite. Run one copy at a time. A second
-copy in the same minute cannot see the first copy's calls.
+data_collection deny, no model fallback, at most 10 cases, one HTTP attempt
+each, sequential and under 20 starts in any 60 seconds. Auth, payment, quota,
+and a provider or model mismatch abort the suite. Run one copy at a time.
+
+The JSON report separates cases, http_attempts, and local_rejections. cases
+counts messages considered. http_attempts counts transport calls, including
+failures. A live run that considers cases but makes no HTTP attempt exits 2
+and sets integration_error. That condition does not consume quota.
 
 The output JSON has decisions, tool names, and the returned model and provider
 when the endpoint sends them. If the API key would appear in that JSON, the

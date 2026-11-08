@@ -34,7 +34,10 @@ def main(argv: list[str] | None = None) -> int:
             report = live_run(args.budget)
     except Exception as exc:
         return _fail(_public_message(exc))
-    return _emit(report, args.output)
+    code = _emit(report, args.output)
+    if report.get("integration_error"):
+        return _fail(str(report["integration_error"]))
+    return code
 
 
 def self_test(budget: int) -> dict:
@@ -104,8 +107,25 @@ def self_test(budget: int) -> dict:
             raise RuntimeError("fixture prompt was not the bundled case")
     _abort_checks(config, LiveCallError, OpenAICompatibleClient, QueueTransport, run_evaluation)
     _window_check()
+    guarded = _guarded_mock_run(config, sentinel)
+    if guarded["http_attempts"] != 10 or guarded["http_attempts"] != guarded["transport_requests"]:
+        raise RuntimeError("guarded live plumbing did not attempt one HTTP call per case")
+    if guarded.get("integration_error"):
+        raise RuntimeError("guarded live plumbing was reported as an integration failure")
+    for case, row in zip(CASES, guarded["results"]):
+        if row["decision"] != case["decision"] or row["writes"] != case["writes"]:
+            raise RuntimeError("guarded mock decision drifted for " + case["id"])
+    zero_attempt = _integration_error(
+        {"http_attempts": 0, "aborted": None, "results": [{"decision": "rejected"}]}
+    )
+    if zero_attempt != "live evaluation made no HTTP attempt":
+        raise RuntimeError("a live run with zero HTTP attempts was treated as success")
     report["self_test"] = "ok"
     report["network_calls"] = 0
+    report["guarded_mock_cases"] = guarded["cases"]
+    report["guarded_mock_http_attempts"] = guarded["http_attempts"]
+    report["guarded_mock_local_rejections"] = guarded["local_rejections"]
+    report["zero_attempt_is_failure"] = True
     report["module_sha256"] = _module_hashes()
     report["live_success_claimed"] = False
     return _sanitize(report, sentinel)
@@ -124,6 +144,9 @@ def live_run(budget: int) -> dict:
         config = None
     report["live_success_claimed"] = False
     report["self_test"] = None
+    problem = _integration_error(report)
+    if problem:
+        report["integration_error"] = problem
     return _sanitize(report, secret)
 
 
@@ -205,23 +228,86 @@ class _StartWindow:
 
 
 class _GuardedClient:
+    """Rate-window around the live adapter. Attribute reads use the inner client."""
+
     def __init__(self, inner, window: _StartWindow):
         self._inner = inner
         self._window = window
-        self.llm_invoked = False
-        self.response_model = None
-        self.response_provider = None
-        self.attempts = 0
 
     def complete(self, event_text: str) -> dict:
         self._window.claim()
-        try:
-            return self._inner.complete(event_text)
-        finally:
-            self.llm_invoked = self._inner.llm_invoked
-            self.response_model = self._inner.response_model
-            self.response_provider = self._inner.response_provider
-            self.attempts = self._inner.attempts
+        return self._inner.complete(event_text)
+
+    def __getattr__(self, name: str):
+        return getattr(self._inner, name)
+
+
+def _guarded_mock_run(config, sentinel: str) -> dict:
+    """One mocked HTTP attempt per fictional case, through the same wrapper as --live."""
+    import json
+
+    from hth.llm import OPENROUTER_BASE_URL, OPENROUTER_MODEL, OpenAICompatibleClient
+    from hth.openrouter_eval import CASES, QueueTransport, run_evaluation
+
+    envelopes = []
+    for case in CASES:
+        envelopes.append(
+            (
+                200,
+                {
+                    "model": OPENROUTER_MODEL,
+                    "provider": "Phala",
+                    "choices": [{"message": {"content": json.dumps(case["response"])}}],
+                },
+            )
+        )
+    transport = QueueTransport(envelopes)
+    client = _GuardedClient(OpenAICompatibleClient(config, transport=transport), _StartWindow())
+    if client.mode != "live":
+        raise RuntimeError("guarded client is not a live adapter")
+    report = run_evaluation(client, 10)
+    if urllib.request.urlopen is not _blocked_urlopen:
+        raise RuntimeError("guarded mock replaced the network block")
+    for request in transport.requests:
+        if request.full_url != OPENROUTER_BASE_URL + "/chat/completions":
+            raise RuntimeError("guarded mock used an unexpected URL")
+        body = json.loads(request.data.decode("utf-8"))
+        encoded = json.dumps(body)
+        if sentinel in encoded or "Authorization" in encoded:
+            raise RuntimeError("request body failed the secret check")
+        if body["model"] != OPENROUTER_MODEL or body["provider"]["only"] != ["phala"]:
+            raise RuntimeError("guarded mock dropped the provider pin")
+        if body["provider"]["allow_fallbacks"] is not False or body["provider"]["data_collection"] != "deny":
+            raise RuntimeError("guarded mock dropped the privacy pin")
+        if "models" in body or "fallbacks" in body:
+            raise RuntimeError("guarded mock added a fallback")
+        if body["response_format"]["json_schema"]["strict"] is not True:
+            raise RuntimeError("guarded mock dropped strict schema")
+    report["transport_requests"] = len(transport.requests)
+    return report
+
+
+def _integration_error(report: dict) -> str | None:
+    attempts = int(report.get("http_attempts") or 0)
+    if attempts == 0 and report.get("aborted") is None and report.get("results"):
+        return "live evaluation made no HTTP attempt"
+    return None
+
+
+def _summary(output: Path, cleaned: dict) -> dict:
+    summary = {
+        "wrote": str(output),
+        "cases": cleaned.get("cases", cleaned.get("calls")),
+        "http_attempts": cleaned.get("http_attempts"),
+        "local_rejections": cleaned.get("local_rejections"),
+        "aborted": cleaned.get("aborted"),
+        "self_test": cleaned.get("self_test"),
+    }
+    if "guarded_mock_http_attempts" in cleaned:
+        summary["guarded_mock_http_attempts"] = cleaned["guarded_mock_http_attempts"]
+    if cleaned.get("integration_error"):
+        summary["integration_error"] = cleaned["integration_error"]
+    return summary
 
 
 def _emit(report: dict, output: Path | None) -> int:
@@ -233,7 +319,7 @@ def _emit(report: dict, output: Path | None) -> int:
     if output is not None:
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(text + "\n", encoding="utf-8")
-        print(json.dumps({"wrote": str(output), "calls": cleaned.get("calls"), "aborted": cleaned.get("aborted"), "self_test": cleaned.get("self_test")}))
+        print(json.dumps(_summary(output, cleaned)))
     else:
         print(text)
     return 0

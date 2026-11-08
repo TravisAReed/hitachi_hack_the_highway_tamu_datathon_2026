@@ -58,6 +58,12 @@ class StandaloneHarnessTests(unittest.TestCase):
             self.assertEqual(report["network_calls"], 0)
             self.assertFalse(report["live_success_claimed"])
             self.assertEqual(report["calls"], 10)
+            self.assertEqual(report["cases"], 10)
+            self.assertEqual(report["http_attempts"], 0)
+            self.assertEqual(report["guarded_mock_http_attempts"], 10)
+            self.assertEqual(report["guarded_mock_cases"], 10)
+            self.assertTrue(report["zero_attempt_is_failure"])
+            self.assertEqual(report["guarded_mock_local_rejections"], 1)
             for name, digest in report["module_sha256"].items():
                 self.assertEqual(hashlib.sha256((PACKAGE / name).read_bytes()).hexdigest(), digest)
             local = run_evaluation(ScriptedExtractor([case["response"] for case in CASES]), 10)
@@ -97,6 +103,48 @@ class StandaloneHarnessTests(unittest.TestCase):
             self.assertEqual(refused.returncode, 2)
             self.assertIn("HTH_LLM_API_KEY", refused.stderr)
             self.assertNotIn("live model request failed", refused.stderr)
+
+    def test_zero_http_attempts_exit_nonzero(self):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+
+        from solution.openrouter_harness import harness_main
+
+        def fake_live(budget):
+            del budget
+            report = {
+                "cases": 10,
+                "calls": 10,
+                "http_attempts": 0,
+                "local_rejections": 10,
+                "aborted": None,
+                "results": [{"id": "supplier-delay", "decision": "rejected", "tools": [], "writes": False}],
+                "live_success_claimed": False,
+                "self_test": None,
+            }
+            report["integration_error"] = harness_main._integration_error(report)
+            return report
+
+        original = harness_main.live_run
+        harness_main.live_run = fake_live
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                output = Path(tmp) / "eval_result.json"
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    code = harness_main.main(["--live", "--confirm-free-quota", "--output", str(output)])
+                saved = json.loads(output.read_text(encoding="utf-8"))
+        finally:
+            harness_main.live_run = original
+        self.assertEqual(code, 2)
+        summary = json.loads(stdout.getvalue())
+        self.assertEqual(summary["cases"], 10)
+        self.assertEqual(summary["http_attempts"], 0)
+        self.assertEqual(summary["integration_error"], "live evaluation made no HTTP attempt")
+        self.assertIn("no HTTP attempt", stderr.getvalue())
+        self.assertEqual(saved["http_attempts"], 0)
+        self.assertNotIn(SENTINEL, stdout.getvalue() + stderr.getvalue())
 
 
 if __name__ == "__main__":
