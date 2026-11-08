@@ -29,6 +29,15 @@ python -m solution.hth.dry_run --evaluate-openrouter --confirm-free-quota
 
 That command is opt-in. It runs at most 10 fictional cases, sequentially, and stops on auth, payment, or quota. It does not read `data/events.json`. Do not run it until `HTH_LLM_API_KEY` is in the environment. No live call has been made.
 
+`python3 -m solution.openrouter_harness.build` writes `hth_openrouter_eval.zip`. The zip copies the adapter, schema, fixtures, and planner modules byte for byte and adds a runner. It does not contain challenge data. On a computer that already has the key in the environment, and does not have this repository:
+
+```bash
+python3 hth_openrouter_eval.zip --self-test
+python3 hth_openrouter_eval.zip --live --confirm-free-quota --output eval_result.json
+```
+
+`--self-test` checks the ten fictional decisions and the transport guards without a key or a network call. `--live` was not run from this repository.
+
 ```bash
 python -m solution.hth.dry_run --data hack_the_highway_student_package/hack_the_highway_package/data --text-file message.txt --event-id local-1 --parser stub --stub-file extraction.json
 python -m solution.hth.dry_run --data hack_the_highway_student_package/hack_the_highway_package/data --text-file message.txt --event-id local-1 --parser live
