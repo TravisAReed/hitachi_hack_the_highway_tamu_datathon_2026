@@ -80,6 +80,8 @@ def _provenance(client, schema_valid: bool, decision: str, reason: str, traces: 
     return {
         "mode": "live" if invoked else "stub",
         "model": getattr(client, "model_name", None) if invoked else None,
+        "response_model": getattr(client, "response_model", None) if invoked else None,
+        "response_provider": getattr(client, "response_provider", None) if invoked else None,
         "llm_invoked": invoked,
         "schema_valid": schema_valid,
         "decision": decision,

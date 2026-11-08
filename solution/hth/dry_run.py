@@ -13,7 +13,8 @@ from .calendarutil import is_working_day
 from .demo import build_demo, build_parse_demo, build_quality_demo
 from .incidents import InputError
 from .interpret import InterpretError, interpret_and_plan, stub_client
-from .llm import LlmConfigError, OpenAICompatibleClient, SchemaError, load_llm_config
+from .llm import EVAL_CALL_BUDGET, LlmConfigError, LiveCallError, OpenAICompatibleClient, SchemaError, load_llm_config, load_openrouter_config
+from .openrouter_eval import run_evaluation
 from .ontology import OntologyError, load_ontology
 from .policy import plan_event
 
@@ -47,6 +48,17 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         help="Write the ontology schema and role graph as JSON. Requires --data. Not a picture of one event.",
     )
+    parser.add_argument(
+        "--evaluate-openrouter",
+        action="store_true",
+        help="Opt-in fictional OpenRouter eval. Requires --confirm-free-quota. Does not read challenge events.",
+    )
+    parser.add_argument(
+        "--confirm-free-quota",
+        action="store_true",
+        help="Acknowledge the free-tier cap of 50 requests/day and 20/minute, including failures.",
+    )
+    parser.add_argument("--eval-budget", type=int, default=EVAL_CALL_BUDGET, help="Max live eval calls, including failures. Cannot exceed 10.")
     args = parser.parse_args(argv)
     demo_flags = (args.demo, args.demo_quality, args.demo_parse)
     if sum(bool(flag) for flag in demo_flags) > 1:
@@ -58,7 +70,7 @@ def main(argv: list[str] | None = None) -> int:
         return _fail("pass structured --input or free text, not both")
     if demo and (args.input or args.check_data or args.text or args.text_file):
         return _fail("a demo does not take --input, --text, or --check-data")
-    if not demo and args.data is None:
+    if not demo and not args.evaluate_openrouter and args.data is None:
         return _fail("pass --data, or pass a demo flag")
     if args.input and args.check_data:
         return _fail("pass either --input or --check-data")
@@ -73,7 +85,17 @@ def main(argv: list[str] | None = None) -> int:
         return _fail("--parser stub needs --stub-file")
     if args.export_architecture and args.data is None:
         return _fail("--export-architecture needs --data")
-    if not demo and not text_mode and args.input is None and not args.check_data and args.export_architecture is None:
+    if args.evaluate_openrouter and not args.confirm_free_quota:
+        return _fail(
+            "refusing the free-tier eval without --confirm-free-quota. "
+            "Free accounts allow 50 requests/day and 20/minute, and failed attempts count. "
+            "This runner stops at 10 calls, does not retry, and aborts on auth, payment, or quota."
+        )
+    if args.evaluate_openrouter and (args.eval_budget < 1 or args.eval_budget > EVAL_CALL_BUDGET):
+        return _fail("--eval-budget must be from 1 to 10")
+    if not demo and not args.evaluate_openrouter and args.data is None:
+        return _fail("pass --data, or pass a demo flag")
+    if not demo and not text_mode and not args.evaluate_openrouter and args.input is None and not args.check_data and args.export_architecture is None:
         return _fail("pass --input, --text, --check-data, --export-architecture, or a demo flag")
 
     horizon = None
@@ -95,6 +117,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.demo_parse:
             ontology, event_id, text, stub = build_parse_demo()
             payload = interpret_and_plan(ontology, event_id, text, stub_client(stub))
+        elif args.evaluate_openrouter:
+            payload = run_evaluation(OpenAICompatibleClient(load_openrouter_config()), args.eval_budget)
         elif args.export_architecture:
             ontology = load_ontology(args.data, horizon)
             payload = architecture_document(ontology)
@@ -112,7 +136,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             ontology = load_ontology(args.data, horizon)
             payload = plan_event(ontology, _read_event(args.input))
-    except (InputError, InterpretError, LlmConfigError, SchemaError, OntologyError, OSError, json.JSONDecodeError) as exc:
+    except (InputError, InterpretError, LlmConfigError, LiveCallError, SchemaError, OntologyError, OSError, json.JSONDecodeError) as exc:
         return _fail(str(exc))
 
     destination = args.export_architecture or args.output
